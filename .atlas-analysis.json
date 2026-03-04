@@ -1,0 +1,126 @@
+{
+  "projectType": "saas",
+  "projectName": "Nanahoshi",
+  "projectDescription": "A modern, fast, self-hosted digital library server for managing books and audiobooks with multi-tenant support.",
+  "theme": "maple",
+  "primaryColor": "#8B5CF6",
+  "lightColor": "#A78BFA",
+  "darkColor": "#7C3AED",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/overview",
+              "concepts/architecture",
+              "concepts/authentication"
+            ]
+          },
+          {
+            "group": "Features",
+            "pages": [
+              "features/library-management",
+              "features/book-organization",
+              "features/search",
+              "features/reading-experience",
+              "features/multi-tenancy"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Deployment",
+        "groups": [
+          {
+            "group": "Setup",
+            "pages": [
+              "deployment/docker",
+              "deployment/configuration",
+              "deployment/environment-variables",
+              "deployment/database"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "deployment/monitoring",
+              "deployment/backup",
+              "deployment/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "api/overview",
+              "api/authentication"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/books",
+              "api/libraries",
+              "api/collections",
+              "api/reading-progress",
+              "api/files",
+              "api/admin"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Development",
+        "groups": [
+          {
+            "group": "Contributing",
+            "pages": [
+              "development/setup",
+              "development/architecture",
+              "development/testing"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Self-hosted digital library management",
+    "Full EPUB support with built-in reader",
+    "Multi-tenant architecture with organizations",
+    "Advanced full-text search with Elasticsearch",
+    "Japanese language support with kuromoji tokenizer",
+    "Automatic metadata extraction and enrichment",
+    "Collections and reading progress tracking",
+    "Docker deployment with complete infrastructure"
+  ],
+  "publicApiSurface": [
+    "POST /api/auth/sign-in",
+    "POST /api/auth/sign-up",
+    "GET /rpc/books.list",
+    "GET /rpc/books.get",
+    "POST /rpc/libraries.create",
+    "GET /rpc/libraries.list",
+    "POST /rpc/libraries.scan",
+    "POST /rpc/collections.create",
+    "GET /rpc/collections.list",
+    "POST /rpc/readingProgress.update",
+    "GET /rpc/readingProgress.get",
+    "GET /download/:uuid"
+  ]
+}
