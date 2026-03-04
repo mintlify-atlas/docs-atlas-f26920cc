@@ -95,8 +95,11 @@
               "api/libraries",
               "api/collections",
               "api/reading-progress",
+              "api/liked-books",
+              "api/profile",
               "api/files",
-              "api/admin"
+              "api/admin",
+              "api/setup"
             ]
           }
         ]

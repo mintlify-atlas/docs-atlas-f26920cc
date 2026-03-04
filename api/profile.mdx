@@ -1,0 +1,187 @@
+---
+title: Profile
+description: User profile and activity management
+---
+
+The profile API manages user profiles, reading statistics, and activity feeds.
+
+## Get profile
+
+Retrieve the current user's profile information.
+
+```typescript
+const profile = await orpc.profile.getProfile.query();
+```
+
+### Response
+
+<ResponseField name="id" type="string">
+  User ID
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Display name
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  User's email address
+</ResponseField>
+
+<ResponseField name="bio" type="string | null">
+  User biography/description
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO timestamp of account creation
+</ResponseField>
+
+## Get statistics
+
+Retrieve reading statistics for the current user.
+
+```typescript
+const stats = await orpc.profile.getStats.query();
+```
+
+### Response
+
+<ResponseField name="totalBooks" type="number">
+  Total books in user's libraries
+</ResponseField>
+
+<ResponseField name="booksRead" type="number">
+  Number of books with "completed" status
+</ResponseField>
+
+<ResponseField name="booksReading" type="number">
+  Number of books with "reading" status
+</ResponseField>
+
+<ResponseField name="totalReadingTime" type="number">
+  Total reading time in minutes
+</ResponseField>
+
+<ResponseField name="likedBooks" type="number">
+  Number of books marked as liked
+</ResponseField>
+
+<ResponseField name="collections" type="number">
+  Number of collections created by the user
+</ResponseField>
+
+## Get activity feed
+
+Retrieve the user's recent reading activity.
+
+```typescript
+const activity = await orpc.profile.getActivityFeed.query({
+  limit: 20
+});
+```
+
+### Parameters
+
+<ParamField path="limit" type="number" default="20">
+  Number of activity items to return
+</ParamField>
+
+### Response
+
+Returns an array of activity events.
+
+<ResponseField name="activities" type="array">
+  <Expandable title="Activity object">
+    <ResponseField name="id" type="string">
+      Activity ID
+    </ResponseField>
+    
+    <ResponseField name="type" type="string">
+      Activity type: "started_reading", "finished_book", "added_to_collection", "liked_book"
+    </ResponseField>
+    
+    <ResponseField name="bookUuid" type="string">
+      UUID of the book involved
+    </ResponseField>
+    
+    <ResponseField name="bookTitle" type="string">
+      Title of the book
+    </ResponseField>
+    
+    <ResponseField name="timestamp" type="string">
+      ISO timestamp of the activity
+    </ResponseField>
+    
+    <ResponseField name="metadata" type="object">
+      Additional activity-specific data
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Update profile
+
+Update the current user's profile information.
+
+```typescript
+const updated = await orpc.profile.updateProfile.mutate({
+  bio: "Avid reader and book collector"
+});
+```
+
+### Parameters
+
+<ParamField path="bio" type="string">
+  User biography (max 500 characters)
+</ParamField>
+
+### Response
+
+Returns the updated profile object.
+
+## Dashboard implementation
+
+Example profile dashboard component:
+
+```typescript
+import { useQuery } from '@tanstack/react-query';
+import { orpc } from '@/utils/orpc';
+
+function ProfileDashboard() {
+  const { data: profile } = useQuery(
+    orpc.profile.getProfile.queryOptions()
+  );
+  
+  const { data: stats } = useQuery(
+    orpc.profile.getStats.queryOptions()
+  );
+  
+  const { data: activity } = useQuery(
+    orpc.profile.getActivityFeed.queryOptions({ limit: 10 })
+  );
+  
+  return (
+    <div>
+      <h1>{profile?.name}</h1>
+      <p>{profile?.bio}</p>
+      
+      <div className="stats">
+        <div>Books Read: {stats?.booksRead}</div>
+        <div>Currently Reading: {stats?.booksReading}</div>
+        <div>Reading Time: {stats?.totalReadingTime} min</div>
+      </div>
+      
+      <div className="activity">
+        <h2>Recent Activity</h2>
+        {activity?.map(item => (
+          <div key={item.id}>
+            {item.type}: {item.bookTitle}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+<Note>
+  All profile endpoints require authentication and only return data for the current user.
+</Note>

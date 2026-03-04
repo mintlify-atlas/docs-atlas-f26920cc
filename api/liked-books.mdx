@@ -1,0 +1,124 @@
+---
+title: Liked books
+description: Manage user's liked/favorited books
+---
+
+The liked books API allows users to favorite books and retrieve their liked book list.
+
+## Toggle like
+
+Add or remove a book from the user's liked books list.
+
+```typescript
+const result = await orpc.likedBooks.toggleLike.mutate({
+  bookUuid: "550e8400-e29b-41d4-a716-446655440000"
+});
+```
+
+### Parameters
+
+<ParamField path="bookUuid" type="string" required>
+  UUID of the book to like/unlike
+</ParamField>
+
+### Response
+
+<ResponseField name="liked" type="boolean">
+  Whether the book is now liked (true) or unliked (false)
+</ResponseField>
+
+## Get like status
+
+Check if a specific book is liked by the current user.
+
+```typescript
+const status = await orpc.likedBooks.getLikeStatus.query({
+  bookUuid: "550e8400-e29b-41d4-a716-446655440000"
+});
+```
+
+### Parameters
+
+<ParamField path="bookUuid" type="string" required>
+  UUID of the book to check
+</ParamField>
+
+### Response
+
+<ResponseField name="liked" type="boolean">
+  Whether the book is liked by the current user
+</ResponseField>
+
+## List liked books
+
+Retrieve a paginated list of books liked by the current user.
+
+```typescript
+const likedBooks = await orpc.likedBooks.listLiked.query({
+  limit: 20
+});
+```
+
+### Parameters
+
+<ParamField path="limit" type="number" default="20">
+  Number of books to return (max 100)
+</ParamField>
+
+### Response
+
+Returns an array of book objects with full metadata.
+
+<ResponseField name="books" type="array">
+  Array of liked books
+  
+  <Expandable title="Book object">
+    <ResponseField name="uuid" type="string">
+      Unique identifier for the book
+    </ResponseField>
+    
+    <ResponseField name="title" type="string">
+      Book title
+    </ResponseField>
+    
+    <ResponseField name="authors" type="array">
+      Array of author names
+    </ResponseField>
+    
+    <ResponseField name="coverUrl" type="string | null">
+      URL to the book's cover image
+    </ResponseField>
+    
+    <ResponseField name="likedAt" type="string">
+      ISO timestamp when the book was liked
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Implementation example
+
+Display a like button in your book UI:
+
+```typescript
+import { useState } from 'react';
+import { orpc } from '@/utils/orpc';
+
+function LikeButton({ bookUuid }: { bookUuid: string }) {
+  const [liked, setLiked] = useState(false);
+  
+  const handleToggle = async () => {
+    const result = await orpc.likedBooks.toggleLike.mutate({ bookUuid });
+    setLiked(result.liked);
+  };
+  
+  return (
+    <button onClick={handleToggle}>
+      {liked ? '❤️ Liked' : '🤍 Like'}
+    </button>
+  );
+}
+```
+
+<Note>
+  All liked books endpoints require authentication. The liked books list is private to each user.
+</Note>

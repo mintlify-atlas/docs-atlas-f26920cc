@@ -328,7 +328,7 @@ const INDEX_NAME = `${env.ELASTICSEARCH_INDEX_PREFIX}_books`;
 ### Index management
 
 The index schema is defined in JSON with custom analyzers:
-- **kuromoji analyzer** - Japanese text tokenization and analysis
+- **Sudachi analyzer** - Japanese text tokenization and analysis
 - **romaji analyzer** - For romanized Japanese text
 - Custom mappings for book fields
 
@@ -429,7 +429,7 @@ Nanahoshi requires several infrastructure services:
 
 ### Elasticsearch
 - Full-text search engine
-- Japanese text analysis with kuromoji tokenizer
+- Japanese text analysis with Sudachi tokenizer
 - Exposed on port 9200 in development
 
 ### Development setup
