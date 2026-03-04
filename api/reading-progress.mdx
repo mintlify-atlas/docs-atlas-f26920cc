@@ -1,0 +1,248 @@
+---
+title: Reading progress
+description: Track user reading progress and status
+---
+
+The reading progress router tracks how far users have read in each book and their reading status.
+
+## Save progress
+
+Update reading progress for a book.
+
+```typescript
+await client.readingProgress.saveProgress({
+  bookUuid: "book-uuid",
+  ttuBookId: 123,
+  exploredCharCount: 5000,
+  bookCharCount: 100000,
+  readingTimeSeconds: 1800,
+  status: "reading",
+});
+```
+
+### Input
+
+<ParamField path="bookUuid" type="string" required>
+  Book UUID
+</ParamField>
+
+<ParamField path="ttuBookId" type="number">
+  Internal TTU book ID (for epub.js integration)
+</ParamField>
+
+<ParamField path="exploredCharCount" type="number">
+  Number of characters read so far
+</ParamField>
+
+<ParamField path="bookCharCount" type="number">
+  Total characters in the book
+</ParamField>
+
+<ParamField path="readingTimeSeconds" type="number">
+  Total reading time in seconds
+</ParamField>
+
+<ParamField path="status" type="enum">
+  Reading status: `unread`, `reading`, or `completed`
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="number">
+  Reading progress record ID
+</ResponseField>
+
+<ResponseField name="userId" type="string">
+  User ID
+</ResponseField>
+
+<ResponseField name="bookUuid" type="string">
+  Book UUID
+</ResponseField>
+
+<ResponseField name="ttuBookId" type="number | null">
+  TTU book ID
+</ResponseField>
+
+<ResponseField name="exploredCharCount" type="number | null">
+  Characters read
+</ResponseField>
+
+<ResponseField name="bookCharCount" type="number | null">
+  Total characters
+</ResponseField>
+
+<ResponseField name="readingTimeSeconds" type="number | null">
+  Reading time in seconds
+</ResponseField>
+
+<ResponseField name="status" type="string | null">
+  Current reading status
+</ResponseField>
+
+<ResponseField name="lastReadAt" type="string">
+  ISO timestamp of last read session
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO timestamp when record was created
+</ResponseField>
+
+## Get progress
+
+Retrieve reading progress for a specific book.
+
+```typescript
+const progress = await client.readingProgress.getProgress({
+  bookUuid: "book-uuid",
+});
+```
+
+### Input
+
+<ParamField path="bookUuid" type="string" required>
+  Book UUID
+</ParamField>
+
+### Response
+
+Reading progress object, or `null` if no progress exists for this book.
+
+## List in-progress books
+
+Get all books the user is currently reading.
+
+```typescript
+const books = await client.readingProgress.listInProgress({
+  limit: 20,
+});
+```
+
+### Input
+
+<ParamField path="limit" type="number" default={20}>
+  Maximum number of books to return (1-50)
+</ParamField>
+
+### Response
+
+Array of objects containing:
+
+<ResponseField name="book" type="object">
+  Complete book object (same structure as `books.getBookWithMetadata`)
+</ResponseField>
+
+<ResponseField name="progress" type="object">
+  Reading progress object for this book
+</ResponseField>
+
+## Reading statuses
+
+The reading status enum is defined in `packages/api/src/constants.ts`:
+
+```typescript
+export const READING_STATUSES = {
+  UNREAD: "unread",
+  READING: "reading",
+  COMPLETED: "completed",
+} as const;
+```
+
+## Input schema
+
+The progress input schema is defined in `packages/api/src/routers/reading-progress/reading-progress.model.ts`:
+
+```typescript
+export const SaveProgressInput = z.object({
+  bookUuid: z.string(),
+  ttuBookId: z.number().int().optional(),
+  exploredCharCount: z.number().int().optional(),
+  bookCharCount: z.number().int().optional(),
+  readingTimeSeconds: z.number().int().optional(),
+  status: z
+    .enum([
+      READING_STATUSES.UNREAD,
+      READING_STATUSES.READING,
+      READING_STATUSES.COMPLETED,
+    ])
+    .optional(),
+});
+```
+
+## Example: Reading progress tracker
+
+```typescript
+import { useEffect } from "react";
+import { orpc } from "@/utils/orpc";
+
+function BookReader({ bookUuid }: { bookUuid: string }) {
+  const { data: progress } = orpc.readingProgress.getProgress.useQuery({
+    bookUuid,
+  });
+  
+  const saveProgress = orpc.readingProgress.saveProgress.useMutation();
+  
+  // Auto-save progress every 30 seconds
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const exploredChars = getExploredCharCount(); // Your implementation
+      const totalChars = getTotalCharCount();
+      const readingTime = getReadingTimeSeconds();
+      
+      saveProgress.mutate({
+        bookUuid,
+        exploredCharCount: exploredChars,
+        bookCharCount: totalChars,
+        readingTimeSeconds: readingTime,
+        status: "reading",
+      });
+    }, 30000);
+    
+    return () => clearInterval(interval);
+  }, [bookUuid]);
+  
+  const percentComplete = progress
+    ? (progress.exploredCharCount / progress.bookCharCount) * 100
+    : 0;
+  
+  return (
+    <div>
+      <div>Progress: {percentComplete.toFixed(1)}%</div>
+      <div>Reading time: {Math.floor(progress?.readingTimeSeconds / 60)} minutes</div>
+      {/* Your reader component */}
+    </div>
+  );
+}
+```
+
+## Example: Continue reading section
+
+```typescript
+import { orpc } from "@/utils/orpc";
+
+function ContinueReading() {
+  const { data: books } = orpc.readingProgress.listInProgress.useQuery({
+    limit: 10,
+  });
+  
+  return (
+    <div>
+      <h2>Continue reading</h2>
+      {books?.map(({ book, progress }) => {
+        const percent = (progress.exploredCharCount / progress.bookCharCount) * 100;
+        
+        return (
+          <div key={book.uuid}>
+            <img src={book.cover} alt={book.title} />
+            <h3>{book.title}</h3>
+            <div>
+              <progress value={percent} max={100} />
+              <span>{percent.toFixed(0)}% complete</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+```

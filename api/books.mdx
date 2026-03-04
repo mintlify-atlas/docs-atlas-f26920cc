@@ -1,0 +1,343 @@
+---
+title: Books
+description: Book search, retrieval, and indexing endpoints
+---
+
+The books router provides endpoints for searching, retrieving, and managing books in your library.
+
+## Get book with metadata
+
+Retrieve a single book with its complete metadata.
+
+```typescript
+const book = await client.books.getBookWithMetadata({
+  uuid: "book-uuid-here",
+});
+```
+
+### Input
+
+<ParamField path="uuid" type="string" required>
+  Book UUID
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="number">
+  Internal book ID
+</ResponseField>
+
+<ResponseField name="uuid" type="string">
+  Book UUID
+</ResponseField>
+
+<ResponseField name="filename" type="string">
+  Original filename
+</ResponseField>
+
+<ResponseField name="filesizeKb" type="number | null">
+  File size in kilobytes
+</ResponseField>
+
+<ResponseField name="title" type="string | null">
+  Book title
+</ResponseField>
+
+<ResponseField name="titleRomaji" type="string | null">
+  Romanized title (for Japanese books)
+</ResponseField>
+
+<ResponseField name="subtitle" type="string | null">
+  Book subtitle
+</ResponseField>
+
+<ResponseField name="description" type="string | null">
+  Book description
+</ResponseField>
+
+<ResponseField name="publishedDate" type="string | null">
+  Publication date
+</ResponseField>
+
+<ResponseField name="languageCode" type="string | null">
+  ISO language code (e.g., "en", "ja")
+</ResponseField>
+
+<ResponseField name="pageCount" type="number | null">
+  Number of pages
+</ResponseField>
+
+<ResponseField name="amountChars" type="number | null">
+  Character count (for text-based formats)
+</ResponseField>
+
+<ResponseField name="isbn10" type="string | null">
+  ISBN-10 identifier
+</ResponseField>
+
+<ResponseField name="isbn13" type="string | null">
+  ISBN-13 identifier
+</ResponseField>
+
+<ResponseField name="asin" type="string | null">
+  Amazon ASIN
+</ResponseField>
+
+<ResponseField name="cover" type="string | null">
+  Cover image URL
+</ResponseField>
+
+<ResponseField name="color" type="string | null">
+  Dominant cover color (hex format)
+</ResponseField>
+
+<ResponseField name="downloadLink" type="string | null">
+  Signed download URL
+</ResponseField>
+
+<ResponseField name="authors" type="array">
+  Array of author objects
+  <ResponseField name="name" type="string">
+    Author name
+  </ResponseField>
+  <ResponseField name="role" type="string | null">
+    Author role (e.g., "author", "translator")
+  </ResponseField>
+</ResponseField>
+
+<ResponseField name="publisher" type="object | undefined">
+  Publisher information
+  <ResponseField name="name" type="string">
+    Publisher name
+  </ResponseField>
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO timestamp when book was added
+</ResponseField>
+
+<ResponseField name="lastModified" type="string | null">
+  Last modification timestamp
+</ResponseField>
+
+## List recent books
+
+Get recently added books, scoped to the user's active organization.
+
+```typescript
+const books = await client.books.listRecent({
+  limit: 20,
+});
+```
+
+### Input
+
+<ParamField path="limit" type="number" default={20}>
+  Maximum number of books to return (1-50)
+</ParamField>
+
+### Response
+
+Array of book objects with the same structure as `getBookWithMetadata`.
+
+## List random books
+
+Get random books from the library.
+
+```typescript
+const books = await client.books.listRandom({
+  limit: 15,
+});
+```
+
+### Input
+
+<ParamField path="limit" type="number" default={15}>
+  Maximum number of books to return (1-50)
+</ParamField>
+
+### Response
+
+Array of book objects with the same structure as `getBookWithMetadata`.
+
+## Search books
+
+Search books using Elasticsearch with support for filters, sorting, and pagination.
+
+```typescript
+const results = await client.books.search({
+  query: "太宰治",
+  filters: {
+    languageCode: ["ja"],
+    publishedDateRange: {
+      from: "1930",
+      to: "1950",
+    },
+    pageCountRange: {
+      min: 100,
+      max: 500,
+    },
+    authors: ["Osamu Dazai"],
+    publishers: ["Shinchosha"],
+  },
+  sort: "relevance",
+  limit: 20,
+  cursor: "optional-cursor-for-pagination",
+});
+```
+
+### Input
+
+<ParamField path="query" type="string">
+  Search query. Supports Japanese text with kuromoji tokenizer.
+</ParamField>
+
+<ParamField path="exactMatch" type="boolean">
+  Whether to perform exact phrase matching
+</ParamField>
+
+<ParamField path="filters" type="object">
+  Search filters
+  <ParamField path="languageCode" type="string[]">
+    Filter by language codes
+  </ParamField>
+  <ParamField path="publishedDateRange" type="object">
+    <ParamField path="from" type="string">
+      Start date (YYYY format)
+    </ParamField>
+    <ParamField path="to" type="string">
+      End date (YYYY format)
+    </ParamField>
+  </ParamField>
+  <ParamField path="pageCountRange" type="object">
+    <ParamField path="min" type="number">
+      Minimum page count
+    </ParamField>
+    <ParamField path="max" type="number">
+      Maximum page count
+    </ParamField>
+  </ParamField>
+  <ParamField path="authors" type="string[]">
+    Filter by author names
+  </ParamField>
+  <ParamField path="series" type="string[]">
+    Filter by series names
+  </ParamField>
+  <ParamField path="publishers" type="string[]">
+    Filter by publisher names
+  </ParamField>
+</ParamField>
+
+<ParamField path="sort" type="enum" default="relevance">
+  Sort order: `relevance`, `newest`, `oldest`, `title_asc`, `title_desc`
+</ParamField>
+
+<ParamField path="limit" type="number" default={20}>
+  Results per page (1-50)
+</ParamField>
+
+<ParamField path="cursor" type="string">
+  Pagination cursor from previous response
+</ParamField>
+
+### Response
+
+<ResponseField name="items" type="array">
+  Array of book objects matching the search criteria
+</ResponseField>
+
+<ResponseField name="cursor" type="string | null">
+  Cursor for fetching the next page, or null if no more results
+</ResponseField>
+
+<ResponseField name="total" type="number">
+  Total number of matching books
+</ResponseField>
+
+## Reindex books
+
+Trigger a full reindex of all books into Elasticsearch. This is useful after Elasticsearch schema changes or data corruption.
+
+```typescript
+const result = await client.books.reindex();
+console.log(result.jobId); // BullMQ job ID
+```
+
+### Response
+
+<ResponseField name="jobId" type="string">
+  BullMQ job ID for tracking the reindex operation
+</ResponseField>
+
+## Book metadata schema
+
+Book metadata is extracted from ebook files using various providers (local extraction from EPUB/PDF metadata).
+
+The metadata schema is defined in `packages/api/src/routers/books/metadata/book.metadata.model.ts`:
+
+```typescript
+export const MetadataInfoSchema = z.object({
+  title: z.string().nullable().optional(),
+  titleRomaji: z.string().nullable().optional(),
+  subtitle: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  publishedDate: z.string().nullable().optional(),
+  languageCode: z.string().nullable().optional(),
+  pageCount: z.number().int().nullable().optional(),
+  isbn10: z.string().nullable().optional(),
+  isbn13: z.string().nullable().optional(),
+  asin: z.string().nullable().optional(),
+  cover: z.string().nullable(),
+  amountChars: z.number().nullable().optional(),
+  authors: z.array(AuthorSchema).nullable().optional(),
+  publisher: PublisherSchema.optional(),
+});
+```
+
+## Example: Implementing book search
+
+```typescript
+import { useState } from "react";
+import { orpc } from "@/utils/orpc";
+
+function BookSearch() {
+  const [query, setQuery] = useState("");
+  
+  const { data, isLoading, fetchNextPage } = orpc.books.search.useInfiniteQuery(
+    {
+      query,
+      limit: 20,
+    },
+    {
+      getNextPageParam: (lastPage) => lastPage.cursor,
+    },
+  );
+
+  const books = data?.pages.flatMap((page) => page.items) ?? [];
+
+  return (
+    <div>
+      <input
+        type="text"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search books..."
+      />
+      
+      {isLoading && <p>Loading...</p>}
+      
+      <div>
+        {books.map((book) => (
+          <div key={book.uuid}>
+            <img src={book.cover} alt={book.title} />
+            <h3>{book.title}</h3>
+            <p>{book.authors?.map((a) => a.name).join(", ")}</p>
+          </div>
+        ))}
+      </div>
+      
+      <button onClick={() => fetchNextPage()}>Load more</button>
+    </div>
+  );
+}
+```

@@ -1,0 +1,505 @@
+---
+title: System architecture
+description: How Nanahoshi is built - monorepo structure, API layer, workers, and infrastructure
+---
+
+Nanahoshi v2 is built as a TypeScript monorepo using Bun workspaces and Turborepo for orchestration.
+
+## Monorepo structure
+
+The codebase is organized into apps and packages:
+
+### Apps
+
+**`apps/server`** - Hono HTTP server
+- Entry point that wires everything together
+- Mounts RPC handler, OpenAPI docs, auth endpoints, and Bull Board dashboard
+- Runs database migrations on startup
+- Registers BullMQ workers as side effects
+
+**`apps/web`** - TanStack Start/React frontend
+- Server-side rendered React application
+- TanStack Router for file-based routing
+- Vite for development and bundling
+- Runs on port 3001 in development
+
+### Packages
+
+**`packages/api`** - Business logic layer
+- oRPC routers for type-safe RPC procedures
+- Service and repository layers
+- BullMQ workers for background jobs
+- Elasticsearch client for search
+
+**`packages/auth`** - Authentication
+- better-auth instance with email/password authentication
+- Organizations plugin for multi-tenancy
+- Admin plugin for role-based access control
+
+**`packages/db`** - Database layer
+- Drizzle ORM schema definitions
+- PostgreSQL client
+- Migration runner
+- Seed data
+
+**`packages/env`** - Environment validation
+- Environment variable validation using `@t3-oss/env-core` and Zod
+- Separate configs for server and web
+
+**`packages/config`** - Shared configuration
+- TypeScript compiler configuration
+- Build tool configuration
+
+## API layer with oRPC
+
+Nanahoshi uses **oRPC** for type-safe remote procedure calls between the frontend and backend.
+
+### Procedure builders
+
+Base procedures are defined in `packages/api/src/index.ts`:
+
+```typescript
+import { ORPCError, os } from "@orpc/server";
+import type { Context } from "./context";
+
+export const o = os.$context<Context>();
+
+export const publicProcedure = o;
+
+const requireAuth = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const protectedProcedure = publicProcedure.use(requireAuth);
+
+const requireAdmin = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  if (context.session.user.role !== "admin") {
+    throw new ORPCError("FORBIDDEN");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const adminProcedure = publicProcedure.use(requireAdmin);
+```
+
+### Context creation
+
+Context is created for each request in `packages/api/src/context.ts`:
+
+```typescript
+import { auth } from "@nanahoshi-v2/auth";
+import type { Context as HonoContext } from "hono";
+
+export async function createContext({ context }: CreateContextOptions) {
+  const session = await auth.api.getSession({
+    headers: context.req.raw.headers,
+  });
+  return {
+    session,
+    req: context.req.raw,
+  };
+}
+```
+
+The better-auth session is extracted from request headers on every call.
+
+### Router composition
+
+Routers are composed in `packages/api/src/routers/index.ts`:
+
+```typescript
+export const appRouter = {
+  healthCheck: publicProcedure.handler(() => "OK"),
+  privateData: protectedProcedure.handler(({ context }) => ({
+    message: "This is private",
+    user: context.session?.user,
+  })),
+  admin: adminRouter,
+  books: booksRouter,
+  collections: collectionsRouter,
+  files: filesRouter,
+  libraries: librariesRouter,
+  setup: setupRouter,
+  readingProgress: readingProgressRouter,
+  likedBooks: likedBooksRouter,
+  profile: profileRouter,
+};
+
+export type AppRouter = typeof appRouter;
+```
+
+### Domain structure
+
+Each domain follows the pattern:
+
+- `*.router.ts` - oRPC procedures with input validation (Zod schemas)
+- `*.service.ts` - Business logic and orchestration
+- `*.repository.ts` - Database queries using Drizzle ORM
+- `*.model.ts` - TypeScript types and Zod schemas
+
+Example from books router (`packages/api/src/routers/books/book.router.ts`):
+
+```typescript
+export const bookRouter = {
+  getBookWithMetadata: protectedProcedure
+    .input(z.object({ uuid: z.string() }))
+    .handler(async ({ input }) => {
+      return await bookService.getBookWithMetadata(input.uuid);
+    }),
+
+  search: protectedProcedure
+    .input(searchInputSchema)
+    .handler(async ({ input }) => {
+      return await bookService.searchBooks(input);
+    }),
+
+  reindex: protectedProcedure.handler(async () => {
+    const job = await bookIndexQueue.add("reindex", {});
+    return { jobId: job.id };
+  }),
+};
+```
+
+## Server application
+
+The Hono server (`apps/server/src/index.ts`) mounts several handlers:
+
+### Route structure
+
+- **`/rpc/*`** - oRPC RPC handler (used by frontend)
+- **`/api-reference/*`** - OpenAPI reference documentation
+- **`/api/auth/*`** - better-auth authentication endpoints
+- **`/admin/queues/`** - Bull Board dashboard for monitoring BullMQ queues
+- **`/download/:uuid`** - Signed URL file downloads
+- **`/reader/*`** - TTU ebook reader static files
+
+### Handler setup
+
+```typescript
+export const rpcHandler = new RPCHandler(appRouter, {
+  interceptors: [
+    onError((error) => {
+      console.error(error);
+    }),
+  ],
+});
+
+app.use("/*", async (c, next) => {
+  const context = await createContext({ context: c });
+
+  const rpcResult = await rpcHandler.handle(c.req.raw, {
+    prefix: "/rpc",
+    context: context,
+  });
+
+  if (rpcResult.matched) {
+    return c.newResponse(rpcResult.response.body, rpcResult.response);
+  }
+
+  // ... handle other routes
+  await next();
+});
+```
+
+### Startup sequence
+
+1. Run database migrations: `await runMigrations()`
+2. Run first-time seed: `await firstSeed()`
+3. Ensure Elasticsearch index exists: `await ensureIndex()`
+4. Import worker modules (side effect registration)
+5. Schedule cron jobs: `scheduleBookIndex()`
+6. Start HTTP server
+
+## React frontend
+
+The web app (`apps/web`) uses TanStack Start with TanStack Router for file-based routing.
+
+### oRPC client setup
+
+The oRPC client is wired into TanStack Query in `apps/web/src/utils/orpc.ts`:
+
+```typescript
+import { createTanstackQueryUtils } from '@orpc/tanstack-query';
+import type { AppRouter } from '@nanahoshi-v2/api/routers/index';
+
+export const orpc = createTanstackQueryUtils<AppRouter>({
+  // ... client config
+});
+```
+
+This provides:
+- `orpc.<router>.<procedure>.queryOptions()` - For TanStack Query queries
+- `orpc.<router>.<procedure>.mutate()` - For mutations
+- Full type safety from backend to frontend
+
+### Route context
+
+Routes receive `{ orpc, queryClient }` in their context. Auth guards use `beforeLoad` to check session and redirect:
+
+```typescript
+export const Route = createFileRoute('/dashboard')__({
+  beforeLoad: async ({ context }) => {
+    const session = await context.orpc.auth.getSession.query();
+    if (!session?.user) {
+      throw redirect({ to: '/login' });
+    }
+    return { session };
+  },
+});
+```
+
+## Database with Drizzle ORM
+
+Nanahoshi uses **Drizzle ORM** with PostgreSQL.
+
+### Schema organization
+
+Schema is split into two files:
+
+**`packages/db/src/schema/general.ts`** - Application tables:
+- `book`, `book_metadata`, `library`, `library_path`
+- `author`, `series`, `publisher`
+- `collection`, `collection_book`
+- `liked_book`, `reading_progress`, `activity`
+- `scanned_file`, `app_settings`
+
+**`packages/db/src/schema/auth.ts`** - better-auth tables:
+- `user`, `session`, `account`, `verification`
+- `organization`, `member`, `invitation`
+- `apikey`
+
+### Migration workflow
+
+1. Edit schema files
+2. Generate migration: `bun run db:generate`
+3. Commit the new migration file
+4. Server applies it automatically on next startup via `runMigrations()`
+
+Migrations are SQL files stored in `packages/db/src/migrations/`.
+
+### Database client
+
+The Drizzle client is created in `packages/db/src/index.ts`:
+
+```typescript
+import { drizzle } from 'drizzle-orm/postgres-js';
+import postgres from 'postgres';
+import { env } from '@nanahoshi-v2/env/server';
+import * as schema from './schema';
+
+const queryClient = postgres(env.DATABASE_URL);
+export const db = drizzle(queryClient, { schema });
+```
+
+## Elasticsearch for search
+
+Nanahoshi uses **Elasticsearch** for full-text search with Japanese language support.
+
+### Client setup
+
+The client is initialized in `packages/api/src/infrastructure/search/elasticsearch/search.client.ts`:
+
+```typescript
+import { Client, HttpConnection } from '@elastic/elasticsearch';
+import { env } from '@nanahoshi-v2/env/server';
+
+export const esClient = new Client({
+  node: env.ELASTICSEARCH_NODE,
+  Connection: HttpConnection,
+});
+
+const INDEX_NAME = `${env.ELASTICSEARCH_INDEX_PREFIX}_books`;
+```
+
+### Index management
+
+The index schema is defined in JSON with custom analyzers:
+- **kuromoji analyzer** - Japanese text tokenization and analysis
+- **romaji analyzer** - For romanized Japanese text
+- Custom mappings for book fields
+
+Schema versioning uses a hash:
+
+```typescript
+const schemaHash = createHash('sha256')
+  .update(schemaContent)
+  .digest('hex')
+  .slice(0, 16);
+```
+
+On startup, `ensureIndex()` checks if the index exists and if the schema changed. If the hash doesn't match, the index is recreated automatically.
+
+### Search operations
+
+```typescript
+export async function searchBooks(
+  request: SearchBooksRequest
+): Promise<SearchBooksResponse> {
+  const searchRequest = buildSearchRequest(INDEX_NAME, request);
+  const result = await esClient.search(searchRequest);
+  // ... process results, extract highlights, build cursor
+  return { books, pagination };
+}
+```
+
+## BullMQ workers
+
+Background jobs are processed by **BullMQ** workers backed by Redis.
+
+### Queue definitions
+
+Three queues are defined in `packages/api/src/infrastructure/queue/queues/`:
+
+**`file-event.queue.ts`**
+- Processes file add/delete events
+- Creates book records
+- Triggers metadata enrichment
+
+**`book-index.queue.ts`**
+- Indexes books into Elasticsearch
+- Handles bulk reindexing
+
+**`cover-color.queue.ts`**
+- Extracts dominant color from book covers
+- Updates book metadata
+
+### Worker registration
+
+Workers are imported as side effects in `apps/server/src/index.ts`:
+
+```typescript
+import '@nanahoshi-v2/api/infrastructure/workers/file.event.worker';
+import '@nanahoshi-v2/api/infrastructure/workers/book.index.worker';
+import '@nanahoshi-v2/api/infrastructure/workers/cover-color.worker';
+```
+
+Each worker file creates a `Worker` instance that processes jobs:
+
+```typescript
+import { Worker } from 'bullmq';
+import { fileEventQueue } from '../queue/queues/file-event.queue';
+
+const worker = new Worker(
+  fileEventQueue.name,
+  async (job) => {
+    // Process job
+  },
+  {
+    connection: redisConnection,
+    concurrency: os.cpus().length, // Auto-scale based on CPU count
+  }
+);
+```
+
+### Monitoring
+
+Bull Board provides a web UI at `/admin/queues/` to:
+- View queue status and job counts
+- Inspect individual jobs
+- Retry failed jobs
+- Clear queues
+
+## Infrastructure
+
+Nanahoshi requires several infrastructure services:
+
+### PostgreSQL
+- Primary database for relational data
+- Uses groonga/pgroonga image for full-text search support
+- Exposed on port 5432 in development
+
+### Redis
+- BullMQ job queue backend
+- Session storage (if configured)
+- Exposed on port 6379 in development
+
+### Elasticsearch
+- Full-text search engine
+- Japanese text analysis with kuromoji tokenizer
+- Exposed on port 9200 in development
+
+### Development setup
+
+Infrastructure is managed via Docker Compose:
+
+```bash
+bun run infra:up    # Start containers
+bun run infra:down  # Stop containers
+bun run infra:logs  # View logs
+```
+
+The compose file reads configuration from `apps/server/.env`.
+
+## Package management
+
+Nanahoshi uses **Bun** as the package manager and runtime.
+
+### Workspace aliases
+
+Packages reference each other via `workspace:*` protocol:
+
+```json
+{
+  "dependencies": {
+    "@nanahoshi-v2/api": "workspace:*",
+    "@nanahoshi-v2/db": "workspace:*",
+    "@nanahoshi-v2/auth": "workspace:*"
+  }
+}
+```
+
+### Catalog dependencies
+
+Shared dependency versions are defined in the root `package.json`:
+
+```json
+{
+  "workspaces": {
+    "catalog": {
+      "drizzle-orm": "^0.30.0",
+      "hono": "^4.0.0"
+    }
+  }
+}
+```
+
+Packages reference catalog versions:
+
+```json
+{
+  "dependencies": {
+    "drizzle-orm": "catalog:"
+  }
+}
+```
+
+## Build system
+
+Turborepo orchestrates builds and development tasks:
+
+```bash
+bun run dev        # Start all services in parallel
+bun run build      # Build all packages
+bun run check      # Lint and format with Biome
+```
+
+Individual packages can be run:
+
+```bash
+bun run dev:server  # Server only
+bun run dev:web     # Web only
+```

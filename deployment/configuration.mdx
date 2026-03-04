@@ -1,0 +1,204 @@
+---
+title: Configuration
+description: Configure Nanahoshi server settings and application behavior
+---
+
+Nanahoshi configuration is managed through environment variables and the admin UI.
+
+## Environment-based configuration
+
+All core settings are defined via environment variables. See [Environment variables](/deployment/environment-variables) for the complete reference.
+
+For production deployment:
+
+1. Copy `.env.example` to `.env`
+2. Generate secure secrets:
+   ```bash
+   # Generate UUIDs
+   uuidgen  # for NAMESPACE_UUID
+   uuidgen  # for DOWNLOAD_SECRET
+   
+   # Generate auth secret (32+ chars)
+   openssl rand -hex 32  # for BETTER_AUTH_SECRET
+   ```
+3. Configure database, SMTP, and service URLs
+4. Set Redis and Postgres passwords
+
+## Application settings
+
+Runtime settings are stored in the `app_settings` database table with a key-value structure:
+
+```typescript
+{
+  id: serial,
+  key: text,
+  value: jsonb,
+  createdAt: timestamp,
+  updatedAt: timestamp
+}
+```
+
+Settings are managed through the admin UI and can include:
+- Default library visibility
+- Metadata provider preferences
+- Scan intervals for cron-watched libraries
+- UI customization options
+
+## Library configuration
+
+Libraries are the top-level organizational units for your books. Each library:
+
+- Has one or more filesystem paths (`library_path` table)
+- Belongs to an organization
+- Can be public or private
+- Optionally supports cron-based automatic scanning
+
+### Creating a library
+
+1. Navigate to the admin UI
+2. Create a new library with a name (e.g., "Manga", "Novels")
+3. Add one or more paths pointing to mounted directories
+4. Enable/disable automatic scanning
+5. Set visibility (public or organization-only)
+
+### Library paths
+
+Each library can have multiple paths:
+
+```typescript
+{
+  id: bigint,
+  libraryId: bigint,
+  path: text,           // e.g., "/books/manga"
+  isEnabled: boolean,   // allow toggling without deletion
+  createdAt: timestamp
+}
+```
+
+<Warning>
+Paths must match container paths (for Docker) or filesystem paths (for bare-metal). Do not use host machine paths when running in Docker.
+</Warning>
+
+## User and organization settings
+
+Nanahoshi uses **better-auth** with the organizations plugin for multi-tenancy:
+
+### Organizations
+
+- Each library belongs to an organization
+- Users are members of one or more organizations
+- Members have roles: `owner`, `admin`, or `member`
+- Organization-scoped libraries are only visible to members
+
+### User roles
+
+Global roles:
+- **admin** — Full system access, can view Bull Board queue dashboard
+- **user** — Standard user (default)
+
+Organization roles (per membership):
+- **owner** — Full organization control
+- **admin** — Manage libraries, members, invitations
+- **member** — Read access to organization libraries
+
+## CORS configuration
+
+The server enforces CORS via the `CORS_ORIGIN` environment variable:
+
+```bash
+CORS_ORIGIN=http://localhost:3001
+```
+
+For multiple origins (not recommended for production), modify `apps/server/src/index.ts`:
+
+```typescript
+cors({
+  origin: [env.CORS_ORIGIN, 'https://example.com'],
+  allowMethods: ['GET', 'POST', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+})
+```
+
+## File scanning behavior
+
+The library scanner:
+
+1. Walks all enabled `library_path` entries
+2. Finds supported file types (`.epub`, `.pdf`, `.cbz`, `.zip`, etc.)
+3. Hashes each file to generate a stable `filehash`
+4. Creates `book` records with a deterministic UUID (using `NAMESPACE_UUID`)
+5. Queues file events for metadata extraction
+6. Tracks scanned files in `scanned_file` table
+
+### Deduplication
+
+Books are deduplicated within each library using a composite unique index:
+
+```sql
+CREATE UNIQUE INDEX books_filehash_per_library_idx 
+ON book (library_id, filehash);
+```
+
+The same file in different libraries will create separate book records.
+
+## Search configuration
+
+Elasticsearch settings:
+
+- **Index name**: `${ELASTICSEARCH_INDEX_PREFIX}_books` (default: `nanahoshi_books`)
+- **Analyzer**: Sudachi tokenizer for Japanese, standard for other languages
+- **Indexed fields**: title, subtitle, description, author names
+
+The index is automatically created and maintained by the `book-index` BullMQ worker.
+
+## Queue configuration
+
+BullMQ queues use Redis for job storage:
+
+- **file-events** — Processes file add/delete/update events
+- **book-index** — Indexes books into Elasticsearch
+- **cover-color** — Extracts dominant colors from book covers
+
+Worker concurrency auto-scales based on CPU count. To override, edit worker initialization in `packages/api/src/infrastructure/queue/workers/`.
+
+## SMTP configuration
+
+Email is used for:
+- Email verification during registration
+- Password reset links
+- Organization invitations
+
+Required environment variables:
+
+```bash
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=you@gmail.com
+SMTP_PASS=your-app-password  # Generate via Google account settings
+```
+
+<Tip>
+For Gmail, use an [App Password](https://support.google.com/accounts/answer/185833) instead of your account password.
+</Tip>
+
+## Data directory
+
+The server stores generated files in `NANAHOSHI_DATA_PATH` (default: `./data`):
+
+- **covers/** — Downloaded/extracted book covers
+- **thumbnails/** — Resized cover thumbnails
+- **cache/** — Temporary metadata cache
+
+In Docker, this is mounted as the `server_data` volume at `/app/apps/server/data`.
+
+## API reference
+
+The OpenAPI reference is auto-generated and served at:
+
+```
+http://localhost:3000/api-reference/
+```
+
+This is built from oRPC procedure definitions in `packages/api/src/routers/`.

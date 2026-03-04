@@ -1,0 +1,204 @@
+---
+title: Files
+description: File download and directory browsing endpoints
+---
+
+The files router provides secure file downloads and directory browsing capabilities.
+
+## Get signed download URL
+
+Generate a signed URL for downloading a book file. The URL is valid for a short time and can only be used once.
+
+```typescript
+const download = await client.files.getSignedDownloadUrl({
+  uuid: "book-uuid",
+});
+
+console.log(download.url); // https://example.com/download/abc123
+console.log(download.filename); // "book.epub"
+
+// Use the URL to download the file
+window.location.href = download.url;
+```
+
+### Input
+
+<ParamField path="uuid" type="string" required>
+  Book UUID
+</ParamField>
+
+### Response
+
+<ResponseField name="url" type="string">
+  Signed download URL (time-limited, single-use)
+</ResponseField>
+
+<ResponseField name="filename" type="string">
+  Original filename of the book file
+</ResponseField>
+
+### Errors
+
+- `NOT_FOUND` - Book with the specified UUID does not exist
+
+## How signed URLs work
+
+Signed download URLs are generated using HMAC signatures to prevent unauthorized access:
+
+1. The server creates a signature using the book UUID, current timestamp, and a secret key
+2. The URL includes the UUID and timestamp as query parameters
+3. When the download endpoint receives a request, it validates:
+   - The signature matches
+   - The URL hasn't expired
+   - The URL hasn't been used before
+
+The implementation is in `packages/api/src/routers/files/helpers/urlSigner.ts`.
+
+## Get directories
+
+Browse filesystem directories (useful for selecting library paths).
+
+```typescript
+const dirs = await client.files.getDirectories({
+  location: "/mnt/books",
+});
+
+console.log(dirs);
+// [
+//   { name: "fiction", path: "/mnt/books/fiction" },
+//   { name: "non-fiction", path: "/mnt/books/non-fiction" },
+// ]
+```
+
+### Input
+
+<ParamField path="location" type="string" required>
+  Filesystem path to list directories from
+</ParamField>
+
+### Response
+
+Array of directory objects:
+
+<ResponseField name="name" type="string">
+  Directory name
+</ResponseField>
+
+<ResponseField name="path" type="string">
+  Full path to the directory
+</ResponseField>
+
+## Download endpoint
+
+The actual file download is handled by a separate HTTP endpoint (not oRPC):
+
+```
+GET /download/:uuid?signature=...&timestamp=...
+```
+
+This endpoint:
+- Validates the signed URL
+- Streams the file directly from the filesystem
+- Sets appropriate headers for browser download
+- Marks the URL as used to prevent replay attacks
+
+You don't need to call this endpoint directly - use `getSignedDownloadUrl` to generate the URL, then use it as a regular link.
+
+## Example: Download button
+
+```typescript
+import { useState } from "react";
+import { orpc } from "@/utils/orpc";
+
+function DownloadButton({ bookUuid }: { bookUuid: string }) {
+  const [isGenerating, setIsGenerating] = useState(false);
+  
+  const handleDownload = async () => {
+    setIsGenerating(true);
+    try {
+      const { url, filename } = await orpc.files.getSignedDownloadUrl.query({
+        uuid: bookUuid,
+      });
+      
+      // Option 1: Redirect to download URL
+      window.location.href = url;
+      
+      // Option 2: Download via fetch + blob
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = filename;
+      a.click();
+      
+      URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      console.error("Download failed:", error);
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+  
+  return (
+    <button onClick={handleDownload} disabled={isGenerating}>
+      {isGenerating ? "Generating..." : "Download"}
+    </button>
+  );
+}
+```
+
+## Example: Directory browser
+
+```typescript
+import { useState } from "react";
+import { orpc } from "@/utils/orpc";
+
+function DirectoryBrowser({ onSelect }: { onSelect: (path: string) => void }) {
+  const [currentPath, setCurrentPath] = useState("/");
+  
+  const { data: directories } = orpc.files.getDirectories.useQuery({
+    location: currentPath,
+  });
+  
+  return (
+    <div>
+      <div>Current: {currentPath}</div>
+      
+      {currentPath !== "/" && (
+        <button onClick={() => setCurrentPath(getParentPath(currentPath))}>
+          ← Back
+        </button>
+      )}
+      
+      <ul>
+        {directories?.map((dir) => (
+          <li key={dir.path}>
+            <button onClick={() => setCurrentPath(dir.path)}>
+              {dir.name}
+            </button>
+            <button onClick={() => onSelect(dir.path)}>
+              Select this folder
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function getParentPath(path: string): string {
+  return path.split("/").slice(0, -1).join("/") || "/";
+}
+```
+
+## Security considerations
+
+- **Signed URLs** - All downloads require a valid signature to prevent unauthorized access
+- **Time-limited** - URLs expire after a short period (configured via `DOWNLOAD_SECRET`)
+- **Single-use** - URLs are marked as used after the first download attempt
+- **Protected procedure** - Only authenticated users can generate download URLs
+- **Organization scoping** - Users can only download books from their active organization
+
+The signing secret is configured via the `DOWNLOAD_SECRET` environment variable in `packages/env/src/server.ts`.

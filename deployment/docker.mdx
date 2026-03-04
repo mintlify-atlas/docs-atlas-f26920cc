@@ -1,0 +1,254 @@
+---
+title: Docker deployment
+description: Deploy Nanahoshi using Docker Compose with all required services
+---
+
+Nanahoshi provides a complete Docker Compose setup that includes the server, web frontend, and all infrastructure services.
+
+## Quick start
+
+1. Clone the repository and copy the environment file:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` and configure required variables (see [Environment variables](/deployment/environment-variables))
+
+3. Start all services:
+
+```bash
+docker compose up -d --build
+```
+
+The application will be available at:
+- **Web UI**: `http://localhost:3001` (or custom `WEB_PORT`)
+- **API Server**: `http://localhost:3000` (or custom `SERVER_PORT`)
+- **Bull Board** (queue dashboard): `http://localhost:3000/admin/queues/`
+
+## Services overview
+
+The `docker-compose.yml` file defines the following services:
+
+### Server
+
+The Hono-based API server that handles all backend logic:
+
+```yaml
+server:
+  build:
+    context: .
+    dockerfile: docker/server/Dockerfile
+  container_name: nanahoshi-v2-server
+  ports:
+    - "${SERVER_PORT:-3000}:3000"
+  volumes:
+    - server_data:/app/apps/server/data
+    # Mount your book directories here
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    elasticsearch:
+      condition: service_started
+  restart: unless-stopped
+```
+
+### Web
+
+The TanStack Start/React frontend:
+
+```yaml
+web:
+  build:
+    context: .
+    dockerfile: docker/web/Dockerfile
+    args:
+      VITE_SERVER_URL: ${VITE_SERVER_URL:-http://localhost:3000}
+  container_name: nanahoshi-v2-web
+  ports:
+    - "${WEB_PORT:-3001}:3000"
+  depends_on:
+    - server
+  restart: unless-stopped
+```
+
+### PostgreSQL
+
+Uses the `groonga/pgroonga` image for full-text search support:
+
+```yaml
+postgres:
+  image: groonga/pgroonga:latest-alpine-16
+  container_name: nanahoshi-v2-postgres
+  environment:
+    POSTGRES_DB: nanahoshi-v2
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+  volumes:
+    - postgres_data:/var/lib/postgresql/data
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 5s
+    timeout: 5s
+    retries: 5
+  restart: unless-stopped
+```
+
+### Redis
+
+Backends the BullMQ job queues:
+
+```yaml
+redis:
+  image: redis:7-alpine
+  container_name: nanahoshi-v2-redis
+  command: redis-server --requirepass ${REDIS_PASSWORD}
+  healthcheck:
+    test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+  restart: unless-stopped
+```
+
+### Elasticsearch
+
+Custom build with Japanese Sudachi analyzer and ICU plugins:
+
+```yaml
+elasticsearch:
+  build:
+    context: .
+    dockerfile: docker/elasticsearch/Dockerfile
+  container_name: nanahoshi-v2-elasticsearch
+  environment:
+    - discovery.type=single-node
+    - xpack.security.enabled=false
+    - ES_JAVA_OPTS=-Xms512m -Xmx1g
+  volumes:
+    - es_data:/usr/share/elasticsearch/data
+  restart: unless-stopped
+```
+
+The Elasticsearch Dockerfile installs:
+- **analysis-icu** plugin for ICU normalization
+- **analysis-sudachi** plugin (v3.4.0) for Japanese tokenization
+- **Sudachi core dictionary** (20260116)
+
+## Volume mounting for books
+
+To make your book files accessible to Nanahoshi, mount them as volumes in the server service. Edit `docker-compose.yml`:
+
+```yaml
+server:
+  volumes:
+    - server_data:/app/apps/server/data
+    # Add your book directories here (read-only recommended)
+    - /path/to/your/manga:/books/manga:ro
+    - /path/to/your/novels:/books/novels:ro
+    - /media/ebooks:/books/ebooks:ro
+```
+
+<Tip>
+Use the `:ro` (read-only) flag to prevent accidental modifications to your source files.
+</Tip>
+
+After mounting, create libraries in the admin UI pointing to these container paths (e.g., `/books/manga`, `/books/novels`).
+
+## Persistent volumes
+
+Docker Compose creates three named volumes:
+
+- **postgres_data** — Database files
+- **es_data** — Elasticsearch indices
+- **server_data** — Application data (covers, metadata cache)
+
+To back up your data:
+
+```bash
+# Stop services
+docker compose down
+
+# Backup volumes
+docker run --rm -v nanahoshi-v2_postgres_data:/data -v $(pwd):/backup alpine tar czf /backup/postgres_backup.tar.gz /data
+docker run --rm -v nanahoshi-v2_es_data:/data -v $(pwd):/backup alpine tar czf /backup/es_backup.tar.gz /data
+
+# Restart
+docker compose up -d
+```
+
+## Logs and monitoring
+
+View logs for all services:
+
+```bash
+docker compose logs -f
+```
+
+View logs for a specific service:
+
+```bash
+docker compose logs -f server
+docker compose logs -f postgres
+```
+
+Access the Bull Board queue dashboard at `http://localhost:3000/admin/queues/` (requires admin role).
+
+## Updating
+
+To update to the latest version:
+
+```bash
+# Pull latest changes
+git pull
+
+# Rebuild and restart
+docker compose up -d --build
+```
+
+<Note>
+Database migrations run automatically on server startup via `runMigrations()`.
+</Note>
+
+## Troubleshooting
+
+### Server fails to start
+
+Check that all required environment variables are set:
+
+```bash
+docker compose logs server
+```
+
+Common issues:
+- Missing `NAMESPACE_UUID`, `DOWNLOAD_SECRET`, or `BETTER_AUTH_SECRET`
+- Incorrect `DATABASE_URL` format
+- Redis password mismatch
+
+### Cannot connect to Elasticsearch
+
+Elasticsearch may take 30-60 seconds to start. Check status:
+
+```bash
+curl http://localhost:9200
+```
+
+Increase memory if needed by editing `ES_JAVA_OPTS` in `docker-compose.yml`:
+
+```yaml
+- ES_JAVA_OPTS=-Xms1g -Xmx2g
+```
+
+### Book files not visible
+
+Verify:
+1. Volume mounts are correct in `docker-compose.yml`
+2. Paths in the library configuration match container paths (not host paths)
+3. File permissions allow the container user to read files
+
+```bash
+# Check mounted volumes
+docker exec nanahoshi-v2-server ls -la /books
+```

@@ -1,0 +1,408 @@
+---
+title: Installation
+description: Set up a local development environment for Nanahoshi
+---
+
+This guide will help you set up a development environment for working on Nanahoshi. You'll be able to run the server and web interface with hot reload, make code changes, and run tests.
+
+## Prerequisites
+
+Before you begin, ensure you have:
+
+- **Bun** >= 1.3.1 installed ([installation guide](https://bun.sh/))
+- **Docker** and **Docker Compose** (for infrastructure services)
+- **Git** for cloning the repository
+- At least 4GB of available RAM
+
+## Development setup
+
+<Steps>
+  <Step title="Clone the repository">
+    Clone the Nanahoshi repository:
+
+    ```bash
+    git clone https://github.com/Natsume-197/nanahoshi.git
+    cd nanahoshi
+    ```
+  </Step>
+
+  <Step title="Install dependencies">
+    Install all workspace dependencies using Bun:
+
+    ```bash
+    bun install
+    ```
+
+    This installs packages for all workspaces in the monorepo using the versions defined in the root `package.json` catalog.
+  </Step>
+
+  <Step title="Configure environment variables">
+    Copy the example environment file for the server:
+
+    ```bash
+    cp .env.example apps/server/.env
+    ```
+
+    Edit `apps/server/.env` and configure the required variables:
+
+    ```bash apps/server/.env
+    # Database (will connect to local Docker container)
+    DATABASE_URL=postgresql://postgres:password@localhost:5432/nanahoshi-v2
+
+    # Development URLs
+    CORS_ORIGIN=http://localhost:3001
+    ENVIRONMENT=development
+    SERVER_URL=http://localhost:3000
+    NANAHOSHI_DATA_PATH=./data
+
+    # Generate secure values
+    NAMESPACE_UUID=00000000-0000-0000-0000-000000000000  # uuidgen
+    DOWNLOAD_SECRET=00000000-0000-0000-0000-000000000000  # uuidgen
+    BETTER_AUTH_SECRET=change-me-to-a-random-string-at-least-32-chars  # openssl rand -hex 32
+    BETTER_AUTH_URL=http://localhost:3000
+
+    # SMTP (for email features)
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=465
+    SMTP_SECURE=true
+    SMTP_USER=you@gmail.com
+    SMTP_PASS=your-app-password
+
+    # Infrastructure (connects to local Docker containers)
+    ELASTICSEARCH_NODE=http://127.0.0.1:9200
+    ELASTICSEARCH_INDEX_PREFIX=nanahoshi
+    REDIS_HOST=127.0.0.1
+    REDIS_PORT=6379
+    REDIS_PASSWORD=change-me
+    ```
+
+    <Note>
+      The infrastructure services (PostgreSQL, Redis, Elasticsearch) will run in Docker, but the server and web apps will run locally with hot reload.
+    </Note>
+  </Step>
+
+  <Step title="Start infrastructure services">
+    Start PostgreSQL, Redis, Elasticsearch, and Kibana using Docker Compose:
+
+    ```bash
+    bun run infra:up
+    ```
+
+    This reads environment variables from `apps/server/.env` and starts the development infrastructure stack.
+
+    <Note>
+      The infrastructure containers run in the background. To view logs:
+
+      ```bash
+      bun run infra:logs
+      ```
+    </Note>
+  </Step>
+
+  <Step title="Generate database migration">
+    On first setup, generate the initial database migration:
+
+    ```bash
+    bun run db:generate
+    ```
+
+    This creates SQL migration files in `packages/db/src/migrations/` based on the Drizzle schema definitions in `packages/db/src/schema/`.
+
+    <Note>
+      Migrations run automatically when the server starts via `runMigrations()` in `apps/server/src/index.ts:252`.
+    </Note>
+  </Step>
+
+  <Step title="Start development servers">
+    Start both the server and web interface with hot reload:
+
+    ```bash
+    bun run dev
+    ```
+
+    This uses Turborepo to run all dev tasks in parallel. You can also run services individually:
+
+    ```bash
+    # Server only (Hono + workers)
+    bun run dev:server
+
+    # Web only (TanStack Start + Vite)
+    bun run dev:web
+    ```
+
+    Once running, access:
+    - **Web interface**: http://localhost:3001
+    - **Server API**: http://localhost:3000
+    - **API reference**: http://localhost:3000/api-reference
+    - **Bull Board**: http://localhost:3000/admin/queues/
+  </Step>
+</Steps>
+
+## Monorepo structure
+
+Nanahoshi uses a Bun workspaces + Turborepo monorepo:
+
+```
+nanahoshi/
+├── apps/
+│   ├── server/          # Hono HTTP server
+│   └── web/             # TanStack Start/React frontend
+├── packages/
+│   ├── api/             # oRPC routers, services, repositories, workers
+│   ├── auth/            # better-auth configuration
+│   ├── db/              # Drizzle ORM schema + migrations
+│   ├── env/             # Environment variable validation
+│   └── config/          # Shared TypeScript/build config
+└── vendor/
+    └── ebook-reader/    # ttu-reader (EPUB reader component)
+```
+
+### Key directories
+
+- **`apps/server/src/index.ts`** - Server entry point, mounts routes and starts workers
+- **`apps/web/src/routes/`** - TanStack Router file-based routes
+- **`packages/api/src/routers/`** - oRPC router definitions
+- **`packages/api/src/infrastructure/`** - Queue, search, and worker infrastructure
+- **`packages/db/src/schema/`** - Database schema definitions
+- **`packages/db/src/migrations/`** - Generated SQL migrations
+
+## Database workflow
+
+Nanahoshi uses Drizzle ORM with SQL migrations:
+
+<Steps>
+  <Step title="Modify the schema">
+    Edit schema files in `packages/db/src/schema/`:
+
+    - `general.ts` - Application tables (books, libraries, authors, etc.)
+    - `auth.ts` - better-auth tables (users, sessions, organizations)
+  </Step>
+
+  <Step title="Generate a migration">
+    After modifying the schema, generate a new SQL migration:
+
+    ```bash
+    bun run db:generate
+    ```
+
+    This creates a timestamped migration file in `packages/db/src/migrations/`.
+  </Step>
+
+  <Step title="Apply the migration">
+    Migrations are applied automatically when you restart the server:
+
+    ```bash
+    bun run dev
+    ```
+
+    The server calls `runMigrations()` on startup, which executes any pending migrations.
+  </Step>
+</Steps>
+
+### Database tools
+
+Additional database commands:
+
+```bash
+# Open Drizzle Studio (visual database browser)
+bun run db:studio
+
+# Manually apply migrations
+bun run db:migrate
+
+# Push schema changes without migrations (dev only)
+bun run db:push
+```
+
+<Warning>
+  `db:push` bypasses migrations and directly applies schema changes. Only use this during early development. Always use `db:generate` and migrations for production.
+</Warning>
+
+## Development commands
+
+### Running services
+
+```bash
+# All services via Turborepo (recommended)
+bun run dev
+
+# Server only (port 3000)
+bun run dev:server
+
+# Web only (port 3001)
+bun run dev:web
+```
+
+### Building
+
+```bash
+# Production build (all packages)
+bun run build
+
+# TypeScript type checking
+bun run check-types
+```
+
+### Code quality
+
+```bash
+# Run Biome linter and formatter
+bun run check
+```
+
+Nanahoshi uses Biome for linting and formatting with:
+- Tabs for indentation
+- Double quotes for strings
+
+### Infrastructure management
+
+```bash
+# Start infrastructure (Postgres, Redis, Elasticsearch, Kibana)
+bun run infra:up
+
+# Stop infrastructure
+bun run infra:down
+
+# View infrastructure logs
+bun run infra:logs
+```
+
+<Note>
+  Infrastructure services use `docker-compose.dev.yml` and read configuration from `apps/server/.env`.
+</Note>
+
+### Clean up
+
+```bash
+# Stop infrastructure
+bun run infra:down
+
+# Delete all volumes (PostgreSQL data, Elasticsearch indices)
+docker volume rm nanahoshi-v2_postgres_data nanahoshi-v2_es_data
+```
+
+## Testing
+
+Nanahoshi uses Bun's built-in test runner. Tests live in `__tests__/` directories next to the code they test:
+
+```bash
+# Run all API tests
+bun test packages/api/
+
+# Run specific test file
+bun test packages/api/src/modules/__tests__/libraryScanner.test.ts
+bun test packages/api/src/routers/books/__tests__/book.repository.test.ts
+```
+
+<Note>
+  Tests mock all external dependencies (database, queues, filesystem) using `mock.module()`. No infrastructure needs to be running.
+</Note>
+
+## Project conventions
+
+### Package manager
+
+Nanahoshi uses **Bun** as the package manager and runtime. Always use:
+
+```bash
+bun install       # Install dependencies
+bun add <package> # Add a new dependency
+bun run <script>  # Run a script
+```
+
+Do not use npm or yarn.
+
+### Type safety
+
+The project uses **oRPC** for end-to-end type safety between backend and frontend:
+
+- Backend exports `AppRouter` type from `packages/api/src/routers/index.ts`
+- Frontend imports the type and gets full autocomplete and type checking
+- Changes to API routes automatically update frontend types
+
+### Workspace imports
+
+Packages reference each other via workspace aliases:
+
+```typescript
+import { auth } from "@nanahoshi-v2/auth";
+import { db } from "@nanahoshi-v2/db";
+import { appRouter } from "@nanahoshi-v2/api/routers/index";
+```
+
+These are defined in `package.json` files with `workspace:*` version specifiers.
+
+### Dependency versions
+
+Shared dependency versions are defined in the root `package.json` `workspaces.catalog` field:
+
+```json package.json
+{
+  "workspaces": {
+    "catalog": {
+      "zod": "^4.1.13",
+      "typescript": "^5"
+    }
+  }
+}
+```
+
+Individual packages reference catalog versions with `catalog:`:
+
+```json packages/api/package.json
+{
+  "dependencies": {
+    "zod": "catalog:"
+  }
+}
+```
+
+## Troubleshooting
+
+### Port conflicts
+
+If you see "port already in use" errors:
+
+- Server uses port **3000**
+- Web uses port **3001**
+- PostgreSQL uses port **5432**
+- Redis uses port **6379**
+- Elasticsearch uses port **9200**
+- Kibana uses port **5601**
+
+Stop any services using these ports or modify the ports in your configuration.
+
+### Database connection errors
+
+Verify that:
+
+1. Infrastructure is running: `docker compose -f docker-compose.dev.yml ps`
+2. `DATABASE_URL` in `apps/server/.env` matches the PostgreSQL container
+3. PostgreSQL is healthy: `docker compose -f docker-compose.dev.yml logs postgres`
+
+### Elasticsearch not starting
+
+Elasticsearch requires at least 2GB of RAM. On Linux, you may need to increase `vm.max_map_count`:
+
+```bash
+sudo sysctl -w vm.max_map_count=262144
+```
+
+### Type errors after schema changes
+
+After modifying database schema:
+
+1. Run `bun run db:generate` to create a migration
+2. Restart the server to apply the migration
+3. Run `bun run check-types` to verify types
+
+## What's next?
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Learn about Nanahoshi's architecture and design patterns
+  </Card>
+  <Card title="Contributing" icon="code-pull-request" href="/development/setup">
+    Guidelines for contributing to Nanahoshi
+  </Card>
+</CardGroup>

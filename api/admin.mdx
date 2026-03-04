@@ -1,0 +1,419 @@
+---
+title: Admin
+description: Administrative endpoints for user and organization management
+---
+
+The admin router provides endpoints for system administration. All endpoints require the `admin` role.
+
+## Get system stats
+
+Retrieve system-wide statistics.
+
+```typescript
+const stats = await client.admin.getSystemStats();
+```
+
+### Response
+
+<ResponseField name="totalUsers" type="number">
+  Total number of users
+</ResponseField>
+
+<ResponseField name="totalBooks" type="number">
+  Total number of books in the system
+</ResponseField>
+
+<ResponseField name="totalLibraries" type="number">
+  Total number of libraries
+</ResponseField>
+
+<ResponseField name="totalOrganizations" type="number">
+  Total number of organizations
+</ResponseField>
+
+## List users
+
+Get all users in the system.
+
+```typescript
+const users = await client.admin.listUsers();
+```
+
+### Response
+
+Array of user objects:
+
+<ResponseField name="id" type="string">
+  User ID
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  User email
+</ResponseField>
+
+<ResponseField name="name" type="string | null">
+  User display name
+</ResponseField>
+
+<ResponseField name="role" type="'user' | 'admin'">
+  User role
+</ResponseField>
+
+<ResponseField name="banned" type="boolean">
+  Whether user is banned
+</ResponseField>
+
+<ResponseField name="emailVerified" type="boolean">
+  Whether email is verified
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO timestamp
+</ResponseField>
+
+## Ban user
+
+Ban a user from the system.
+
+```typescript
+await client.admin.banUser({
+  userId: "user-id",
+});
+```
+
+### Input
+
+<ParamField path="userId" type="string" required>
+  User ID to ban
+</ParamField>
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Always `true`
+</ResponseField>
+
+## Unban user
+
+Remove a ban from a user.
+
+```typescript
+await client.admin.unbanUser({
+  userId: "user-id",
+});
+```
+
+### Input
+
+<ParamField path="userId" type="string" required>
+  User ID to unban
+</ParamField>
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Always `true`
+</ResponseField>
+
+## Set user role
+
+Change a user's role.
+
+```typescript
+await client.admin.setUserRole({
+  userId: "user-id",
+  role: "admin",
+});
+```
+
+### Input
+
+<ParamField path="userId" type="string" required>
+  User ID
+</ParamField>
+
+<ParamField path="role" type="enum" required>
+  New role: `user` or `admin`
+</ParamField>
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Always `true`
+</ResponseField>
+
+## List organizations
+
+Get all organizations in the system.
+
+```typescript
+const orgs = await client.admin.listOrganizations();
+```
+
+### Response
+
+Array of organization objects:
+
+<ResponseField name="id" type="string">
+  Organization ID
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Organization name
+</ResponseField>
+
+<ResponseField name="slug" type="string">
+  Organization slug (unique identifier)
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO timestamp
+</ResponseField>
+
+<ResponseField name="memberCount" type="number">
+  Number of members
+</ResponseField>
+
+## Create organization
+
+Create a new organization.
+
+```typescript
+const org = await client.admin.createOrganization({
+  name: "Acme Corp",
+  slug: "acme-corp",
+});
+```
+
+### Input
+
+<ParamField path="name" type="string" required>
+  Organization name (minimum 1 character)
+</ParamField>
+
+<ParamField path="slug" type="string" required>
+  Organization slug (minimum 1 character, must be unique)
+</ParamField>
+
+### Response
+
+Created organization object.
+
+## Delete organization
+
+Delete an organization and all its data.
+
+```typescript
+await client.admin.deleteOrganization({
+  orgId: "org-id",
+});
+```
+
+### Input
+
+<ParamField path="orgId" type="string" required>
+  Organization ID
+</ParamField>
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Always `true`
+</ResponseField>
+
+## Get organization with members
+
+Retrieve detailed organization information including all members.
+
+```typescript
+const org = await client.admin.getOrgWithMembers({
+  orgId: "org-id",
+});
+```
+
+### Input
+
+<ParamField path="orgId" type="string" required>
+  Organization ID
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="string">
+  Organization ID
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Organization name
+</ResponseField>
+
+<ResponseField name="slug" type="string">
+  Organization slug
+</ResponseField>
+
+<ResponseField name="members" type="array">
+  Array of member objects
+  <ResponseField name="id" type="string">
+    Member ID
+  </ResponseField>
+  <ResponseField name="userId" type="string">
+    User ID
+  </ResponseField>
+  <ResponseField name="organizationId" type="string">
+    Organization ID
+  </ResponseField>
+  <ResponseField name="role" type="string">
+    Member role in organization
+  </ResponseField>
+  <ResponseField name="user" type="object">
+    User information
+  </ResponseField>
+</ResponseField>
+
+## Remove member
+
+Remove a member from an organization.
+
+```typescript
+await client.admin.removeMember({
+  memberId: "member-id",
+});
+```
+
+### Input
+
+<ParamField path="memberId" type="string" required>
+  Member ID (not user ID)
+</ParamField>
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Always `true`
+</ResponseField>
+
+## Update member role
+
+Change a member's role within an organization.
+
+```typescript
+await client.admin.updateMemberRole({
+  memberId: "member-id",
+  role: "admin",
+});
+```
+
+### Input
+
+<ParamField path="memberId" type="string" required>
+  Member ID
+</ParamField>
+
+<ParamField path="role" type="string" required>
+  New role (organization-specific role)
+</ParamField>
+
+### Response
+
+<ResponseField name="success" type="boolean">
+  Always `true`
+</ResponseField>
+
+## Backfill cover colors
+
+Trigger a background job to extract dominant colors from book covers that are missing color information.
+
+```typescript
+const result = await client.admin.backfillCoverColors();
+console.log(`Enqueued ${result.enqueued} books`);
+```
+
+### Response
+
+<ResponseField name="enqueued" type="number">
+  Number of books queued for color extraction
+</ResponseField>
+
+## Admin authorization
+
+All admin endpoints use `adminProcedure`, which requires:
+
+1. An authenticated session (`UNAUTHORIZED` if missing)
+2. The `admin` role (`FORBIDDEN` if not admin)
+
+```typescript
+const requireAdmin = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  if (context.session.user.role !== "admin") {
+    throw new ORPCError("FORBIDDEN");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const adminProcedure = publicProcedure.use(requireAdmin);
+```
+
+## Example: Admin dashboard
+
+```typescript
+import { orpc } from "@/utils/orpc";
+
+function AdminDashboard() {
+  const { data: stats } = orpc.admin.getSystemStats.useQuery();
+  const { data: users } = orpc.admin.listUsers.useQuery();
+  const { data: orgs } = orpc.admin.listOrganizations.useQuery();
+  
+  const banUser = orpc.admin.banUser.useMutation();
+  const setRole = orpc.admin.setUserRole.useMutation();
+  
+  return (
+    <div>
+      <h1>System stats</h1>
+      <div>
+        <p>Users: {stats?.totalUsers}</p>
+        <p>Books: {stats?.totalBooks}</p>
+        <p>Libraries: {stats?.totalLibraries}</p>
+        <p>Organizations: {stats?.totalOrganizations}</p>
+      </div>
+      
+      <h2>Users</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Role</th>
+            <th>Banned</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {users?.map((user) => (
+            <tr key={user.id}>
+              <td>{user.email}</td>
+              <td>{user.role}</td>
+              <td>{user.banned ? "Yes" : "No"}</td>
+              <td>
+                <button onClick={() => banUser.mutate({ userId: user.id })}>
+                  {user.banned ? "Unban" : "Ban"}
+                </button>
+                <button onClick={() => setRole.mutate({
+                  userId: user.id,
+                  role: user.role === "admin" ? "user" : "admin",
+                })}>
+                  Toggle admin
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```

@@ -1,0 +1,373 @@
+---
+title: Database
+description: PostgreSQL setup, schema management, and running migrations with Drizzle
+---
+
+Nanahoshi uses **PostgreSQL** with **Drizzle ORM** for type-safe database access and SQL migrations.
+
+## PostgreSQL setup
+
+### Using Docker (recommended)
+
+The easiest way to run PostgreSQL is with the included Docker Compose setup:
+
+```bash
+bun run infra:up
+```
+
+This starts:
+- PostgreSQL (port 5432) with the `groonga/pgroonga:latest-alpine-16` image
+- Redis (port 6379)
+- Elasticsearch (port 9200)
+- Kibana (port 5602)
+
+The `groonga/pgroonga` image includes the **pgroonga** extension for full-text search support.
+
+### Manual installation
+
+For bare-metal installations:
+
+1. Install PostgreSQL 16+
+2. Create a database:
+
+```sql
+CREATE DATABASE "nanahoshi-v2";
+```
+
+3. Update `DATABASE_URL` in `.env`:
+
+```bash
+DATABASE_URL=postgresql://postgres:password@localhost:5432/nanahoshi-v2
+```
+
+## Database schema
+
+The schema is defined in TypeScript using Drizzle ORM in `packages/db/src/schema/`:
+
+- **general.ts** — Application tables (books, libraries, collections, etc.)
+- **auth.ts** — better-auth tables (users, sessions, organizations, etc.)
+- **index.ts** — Schema exports
+
+### Key tables
+
+#### book
+
+Core book records:
+
+```typescript
+{
+  id: bigint,                    // Auto-incrementing ID
+  uuid: uuid,                    // Stable UUID for links (generated from filehash + NAMESPACE_UUID)
+  filename: text,
+  filehash: text,                // SHA-256 hash for deduplication
+  relativePath: text,            // Path relative to library_path
+  libraryId: bigint,
+  libraryPathId: bigint,
+  mediaType: varchar(16),        // e.g., "application/epub+zip"
+  filesizeKb: bigint,
+  lastModified: timestamp,
+  userId: text,                  // Creator/uploader
+  createdAt: timestamp
+}
+```
+
+**Unique constraint**: `(library_id, filehash)` — prevents duplicate files within a library.
+
+#### book_metadata
+
+Extracted and enriched metadata:
+
+```typescript
+{
+  bookId: bigint,                // Foreign key to book.id
+  title: varchar(255),
+  subtitle: varchar(255),
+  titleRomaji: varchar,          // Romanized title for Japanese books
+  description: text,
+  publishedDate: date,
+  languageCode: varchar(8),      // ISO 639-1 (e.g., "en", "ja")
+  pageCount: integer,
+  isbn10: varchar(32),
+  isbn13: varchar(32),
+  asin: varchar(32),             // Amazon Standard Identification Number
+  cover: varchar(255),           // Path to cover image
+  mainColor: varchar,            // Dominant cover color (hex)
+  amountChars: bigint,           // Character count for reading progress
+  publisherId: integer,
+  seriesId: integer
+}
+```
+
+#### library & library_path
+
+Libraries organize books and map to filesystem paths:
+
+```typescript
+library {
+  id: bigint,
+  name: text,
+  organizationId: text,          // Owner organization
+  isPublic: boolean,             // Visible to all users?
+  isCronWatch: boolean,          // Enable automatic scanning?
+  createdAt: timestamp
+}
+
+library_path {
+  id: bigint,
+  libraryId: bigint,
+  path: text,                    // e.g., "/books/manga"
+  isEnabled: boolean,            // Toggle without deletion
+  createdAt: timestamp
+}
+```
+
+**Unique constraint**: `(library_id, path)` — one library cannot have duplicate paths.
+
+#### scanned_file
+
+Tracks which files have been scanned:
+
+```typescript
+{
+  id: serial,
+  path: text,
+  libraryPathId: bigint,
+  size: integer,
+  mtime: timestamp,              // Last modified time
+  status: varchar(20),           // 'pending', 'processed', 'error'
+  hash: text,                    // File hash
+  error: text,                   // Error message if failed
+  createdAt: timestamp,
+  updatedAt: timestamp
+}
+```
+
+**Unique constraint**: `(path, library_path_id)` — tracks each file per library path.
+
+## Migrations
+
+Nanahoshi uses **Drizzle Kit** for generating and running SQL migrations.
+
+### Automatic migrations (production)
+
+Migrations run automatically on server startup via `runMigrations()` in `packages/db/src/migrate.ts`:
+
+```typescript
+import { migrate } from 'drizzle-orm/node-postgres/migrator';
+
+export async function runMigrations() {
+  const migrationsFolder = path.join(__dirname, 'migrations');
+  console.log(`Running migrations from ${migrationsFolder}...`);
+  await migrate(db, { migrationsFolder });
+  console.log('Migrations applied successfully.');
+}
+```
+
+This is called in `apps/server/src/index.ts` before starting the HTTP server.
+
+### Manual migration workflow (development)
+
+1. **Modify the schema** in `packages/db/src/schema/`
+
+2. **Generate a migration**:
+
+```bash
+bun run db:generate
+```
+
+This creates a new SQL file in `packages/db/src/migrations/` with auto-generated DDL statements.
+
+3. **Review the migration** file to ensure correctness
+
+4. **Apply migrations**:
+
+For development (using Drizzle Kit):
+
+```bash
+bun run db:migrate
+```
+
+For production (automatic on server start):
+
+```bash
+bun run dev:server
+# or
+docker compose up -d
+```
+
+### Migration commands
+
+From the repository root:
+
+```bash
+# Generate migration after schema changes
+bun run db:generate
+
+# Open Drizzle Studio (visual database editor)
+bun run db:studio
+
+# Push schema directly (no migration file - dev only)
+bun run db:push
+```
+
+From `packages/db/`:
+
+```bash
+# Start infrastructure (Postgres, Redis, Elasticsearch)
+bun run db:start
+
+# Start with logs
+bun run db:watch
+
+# Stop services
+bun run db:stop
+
+# Stop and remove volumes
+bun run db:down
+```
+
+## Drizzle configuration
+
+Configuration is defined in `packages/db/drizzle.config.ts`:
+
+```typescript
+import { defineConfig } from 'drizzle-kit';
+
+export default defineConfig({
+  schema: './src/schema',           // Schema directory
+  out: './src/migrations',          // Migration output directory
+  dialect: 'postgresql',
+  dbCredentials: {
+    url: process.env.DATABASE_URL || '',
+  },
+});
+```
+
+Drizzle Kit reads `DATABASE_URL` from `apps/server/.env`.
+
+## pgroonga extension
+
+The `groonga/pgroonga` Docker image includes the **pgroonga** extension for full-text search. This is not currently used in the schema but is available for future use.
+
+To enable:
+
+```sql
+CREATE EXTENSION pgroonga;
+```
+
+Nanahoshi currently uses **Elasticsearch** for full-text search instead of PostgreSQL full-text capabilities.
+
+## Connection pooling
+
+Drizzle uses the `pg` driver with a connection pool:
+
+```typescript
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool } from 'pg';
+
+const pool = new Pool({
+  connectionString: env.DATABASE_URL,
+});
+
+export const db = drizzle(pool, { schema });
+```
+
+Default pool size is 10 connections. To customize, set `PGPOOLSIZE` in your environment.
+
+## Seeding
+
+The server runs `firstSeed()` on startup (after migrations) to create initial data:
+
+- Default admin user (if no users exist)
+- Default organization
+- System settings
+
+Seed logic is in `packages/db/src/seed/seed.ts`.
+
+## Backups
+
+### Docker volumes
+
+For Docker deployments, back up the `postgres_data` volume:
+
+```bash
+docker compose down
+docker run --rm -v nanahoshi-v2_postgres_data:/data -v $(pwd):/backup alpine tar czf /backup/postgres_backup.tar.gz /data
+docker compose up -d
+```
+
+Restore:
+
+```bash
+docker compose down
+docker run --rm -v nanahoshi-v2_postgres_data:/data -v $(pwd):/backup alpine sh -c "rm -rf /data/* && tar xzf /backup/postgres_backup.tar.gz -C /"
+docker compose up -d
+```
+
+### pg_dump
+
+For bare-metal installations:
+
+```bash
+# Backup
+pg_dump -U postgres nanahoshi-v2 > backup.sql
+
+# Restore
+psql -U postgres nanahoshi-v2 < backup.sql
+```
+
+## Troubleshooting
+
+### Migration fails with "already exists"
+
+If migrations are out of sync:
+
+1. Check the `drizzle.__drizzle_migrations` table:
+
+```sql
+SELECT * FROM drizzle.__drizzle_migrations;
+```
+
+2. Manually mark migrations as applied (if safe):
+
+```sql
+INSERT INTO drizzle.__drizzle_migrations (hash, created_at)
+VALUES ('migration_name', NOW());
+```
+
+3. Or reset and re-apply:
+
+```bash
+bun run db:push  # Dangerous: force schema to match
+```
+
+### Connection refused
+
+Check that PostgreSQL is running:
+
+```bash
+pg_isready -h localhost -p 5432
+```
+
+For Docker:
+
+```bash
+docker compose ps postgres
+docker compose logs postgres
+```
+
+### Performance issues
+
+Add indexes for frequently queried columns:
+
+```typescript
+// In schema file
+index('idx_book_library_id').on(book.libraryId)
+```
+
+Then generate and apply migration:
+
+```bash
+bun run db:generate
+bun run db:migrate
+```

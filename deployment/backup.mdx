@@ -1,0 +1,324 @@
+---
+title: Backup and recovery
+description: Backup strategies for database, volumes, and Elasticsearch indexes
+---
+
+## Database backup
+
+Nanahoshi uses PostgreSQL (groonga/pgroonga) for relational data.
+
+### Automated backups with pg_dump
+
+Create a backup script:
+
+```bash backup.sh
+#!/bin/bash
+BACKUP_DIR="/path/to/backups"
+DATE=$(date +%Y%m%d_%H%M%S)
+DOCKER_CONTAINER="nanahoshi-v2-postgres"
+
+mkdir -p "$BACKUP_DIR"
+
+docker exec $DOCKER_CONTAINER pg_dump -U postgres nanahoshi-v2 | gzip > "$BACKUP_DIR/nanahoshi_$DATE.sql.gz"
+
+# Keep only last 7 days
+find "$BACKUP_DIR" -name "nanahoshi_*.sql.gz" -mtime +7 -delete
+
+echo "Backup completed: nanahoshi_$DATE.sql.gz"
+```
+
+Make it executable and schedule with cron:
+
+```bash
+chmod +x backup.sh
+
+# Run daily at 2 AM
+crontab -e
+# Add: 0 2 * * * /path/to/backup.sh
+```
+
+### Manual backup
+
+```bash
+# Backup all data
+docker exec nanahoshi-v2-postgres pg_dump -U postgres nanahoshi-v2 > backup.sql
+
+# Backup with compression
+docker exec nanahoshi-v2-postgres pg_dump -U postgres nanahoshi-v2 | gzip > backup.sql.gz
+
+# Backup specific tables
+docker exec nanahoshi-v2-postgres pg_dump -U postgres -t book -t book_metadata nanahoshi-v2 > books_backup.sql
+```
+
+### Restore from backup
+
+<Warning>
+  Stop the server before restoring to prevent data conflicts.
+</Warning>
+
+```bash
+# Stop server
+docker stop nanahoshi-v2-server
+
+# Drop and recreate database
+docker exec -it nanahoshi-v2-postgres psql -U postgres -c "DROP DATABASE \"nanahoshi-v2\";"
+docker exec -it nanahoshi-v2-postgres psql -U postgres -c "CREATE DATABASE \"nanahoshi-v2\";"
+
+# Restore from backup
+gunzip -c backup.sql.gz | docker exec -i nanahoshi-v2-postgres psql -U postgres nanahoshi-v2
+
+# Restart server (migrations will run automatically)
+docker start nanahoshi-v2-server
+```
+
+## Volume backup
+
+Nanahoshi uses Docker volumes defined in `docker-compose.yml`:
+
+```yaml
+# docker-compose.yml:102-105
+volumes:
+  postgres_data:  # PostgreSQL data
+  es_data:        # Elasticsearch indexes
+  server_data:    # Covers, cache, and app data
+```
+
+### Backup all volumes
+
+```bash backup-volumes.sh
+#!/bin/bash
+BACKUP_DIR="/path/to/volume-backups"
+DATE=$(date +%Y%m%d_%H%M%S)
+
+mkdir -p "$BACKUP_DIR/$DATE"
+
+# Backup postgres_data
+docker run --rm \
+  -v nanahoshi-v2_postgres_data:/data \
+  -v "$BACKUP_DIR/$DATE":/backup \
+  alpine tar czf /backup/postgres_data.tar.gz -C /data .
+
+# Backup es_data
+docker run --rm \
+  -v nanahoshi-v2_es_data:/data \
+  -v "$BACKUP_DIR/$DATE":/backup \
+  alpine tar czf /backup/es_data.tar.gz -C /data .
+
+# Backup server_data (covers, cache)
+docker run --rm \
+  -v nanahoshi-v2_server_data:/data \
+  -v "$BACKUP_DIR/$DATE":/backup \
+  alpine tar czf /backup/server_data.tar.gz -C /data .
+
+echo "Volume backups completed: $BACKUP_DIR/$DATE"
+```
+
+### Restore volumes
+
+<Steps>
+  <Step title="Stop containers">
+    ```bash
+    docker compose down
+    ```
+  </Step>
+  <Step title="Remove existing volumes">
+    ```bash
+    docker volume rm nanahoshi-v2_postgres_data
+    docker volume rm nanahoshi-v2_es_data
+    docker volume rm nanahoshi-v2_server_data
+    ```
+  </Step>
+  <Step title="Restore from backup">
+    ```bash
+    BACKUP_DATE="20260304_020000"  # Your backup timestamp
+    
+    # Restore postgres_data
+    docker volume create nanahoshi-v2_postgres_data
+    docker run --rm \
+      -v nanahoshi-v2_postgres_data:/data \
+      -v "/path/to/volume-backups/$BACKUP_DATE":/backup \
+      alpine tar xzf /backup/postgres_data.tar.gz -C /data
+    
+    # Restore es_data
+    docker volume create nanahoshi-v2_es_data
+    docker run --rm \
+      -v nanahoshi-v2_es_data:/data \
+      -v "/path/to/volume-backups/$BACKUP_DATE":/backup \
+      alpine tar xzf /backup/es_data.tar.gz -C /data
+    
+    # Restore server_data
+    docker volume create nanahoshi-v2_server_data
+    docker run --rm \
+      -v nanahoshi-v2_server_data:/data \
+      -v "/path/to/volume-backups/$BACKUP_DATE":/backup \
+      alpine tar xzf /backup/server_data.tar.gz -C /data
+    ```
+  </Step>
+  <Step title="Restart containers">
+    ```bash
+    docker compose up -d
+    ```
+  </Step>
+</Steps>
+
+## Elasticsearch snapshots
+
+### Configure snapshot repository
+
+Elasticsearch snapshots require a shared filesystem repository.
+
+<Steps>
+  <Step title="Add volume mount">
+    Edit `docker-compose.yml`:
+    
+    ```yaml
+    elasticsearch:
+      volumes:
+        - es_data:/usr/share/elasticsearch/data
+        - es_snapshots:/usr/share/elasticsearch/snapshots
+    
+    volumes:
+      postgres_data:
+      es_data:
+      es_snapshots:  # Add this
+      server_data:
+    ```
+  </Step>
+  <Step title="Configure path.repo">
+    Update `docker/elasticsearch/Dockerfile` or add environment variable:
+    
+    ```yaml
+    elasticsearch:
+      environment:
+        - path.repo=/usr/share/elasticsearch/snapshots
+    ```
+  </Step>
+  <Step title="Restart Elasticsearch">
+    ```bash
+    docker compose restart elasticsearch
+    ```
+  </Step>
+  <Step title="Register repository">
+    ```bash
+    curl -X PUT "http://localhost:9200/_snapshot/nanahoshi_backup" -H 'Content-Type: application/json' -d'
+    {
+      "type": "fs",
+      "settings": {
+        "location": "/usr/share/elasticsearch/snapshots",
+        "compress": true
+      }
+    }'
+    ```
+  </Step>
+</Steps>
+
+### Create snapshot
+
+```bash
+# Snapshot the books index
+curl -X PUT "http://localhost:9200/_snapshot/nanahoshi_backup/snapshot_$(date +%Y%m%d_%H%M%S)?wait_for_completion=true" -H 'Content-Type: application/json' -d'
+{
+  "indices": "nanahoshi_books",
+  "include_global_state": false
+}'
+```
+
+### Restore from snapshot
+
+<Warning>
+  Close the index before restoring to prevent conflicts.
+</Warning>
+
+```bash
+# Close index
+curl -X POST "http://localhost:9200/nanahoshi_books/_close"
+
+# Restore snapshot
+curl -X POST "http://localhost:9200/_snapshot/nanahoshi_backup/snapshot_20260304_020000/_restore?wait_for_completion=true"
+
+# Reopen index
+curl -X POST "http://localhost:9200/nanahoshi_books/_open"
+```
+
+### Automated snapshot script
+
+```bash snapshot-es.sh
+#!/bin/bash
+ES_HOST="http://localhost:9200"
+REPO="nanahoshi_backup"
+SNAPSHOT="snapshot_$(date +%Y%m%d_%H%M%S)"
+
+curl -X PUT "$ES_HOST/_snapshot/$REPO/$SNAPSHOT?wait_for_completion=true" \
+  -H 'Content-Type: application/json' -d'{
+    "indices": "nanahoshi_books",
+    "include_global_state": false
+  }'
+
+echo "Snapshot created: $SNAPSHOT"
+
+# Delete snapshots older than 7 days
+curl -s "$ES_HOST/_snapshot/$REPO/_all" | jq -r '.snapshots[].snapshot' | while read snap; do
+  SNAP_DATE=$(echo $snap | sed 's/snapshot_//')
+  SNAP_EPOCH=$(date -d "${SNAP_DATE:0:8} ${SNAP_DATE:9:2}:${SNAP_DATE:11:2}:${SNAP_DATE:13:2}" +%s 2>/dev/null)
+  NOW_EPOCH=$(date +%s)
+  AGE_DAYS=$(( ($NOW_EPOCH - $SNAP_EPOCH) / 86400 ))
+  
+  if [ $AGE_DAYS -gt 7 ]; then
+    echo "Deleting old snapshot: $snap"
+    curl -X DELETE "$ES_HOST/_snapshot/$REPO/$snap"
+  fi
+done
+```
+
+## Book file backup
+
+<Info>
+  Nanahoshi does not copy book files—it references them in place. Your original book directories are the source of truth.
+</Info>
+
+### What to backup
+
+<CardGroup cols={2}>
+  <Card title="Book files" icon="book">
+    Your original mounted directories (e.g., `/path/to/manga`, `/path/to/novels`) must be backed up separately
+  </Card>
+  <Card title="Generated data" icon="images">
+    `server_data` volume contains extracted covers and cache—can be regenerated by rescanning
+  </Card>
+</CardGroup>
+
+### Backup mounted book directories
+
+```bash
+# Example: backup book directories with rsync
+rsync -av --delete /path/to/manga /path/to/backup/manga
+rsync -av --delete /path/to/novels /path/to/backup/novels
+```
+
+Or use your preferred backup solution (Time Machine, Borg, Restic, etc.).
+
+## Disaster recovery plan
+
+<Steps>
+  <Step title="Backup essentials">
+    - PostgreSQL database (pg_dump)
+    - `.env` file with secrets
+    - Original book directories
+  </Step>
+  <Step title="Optional backups">
+    - Elasticsearch snapshots (can be rebuilt with reindex)
+    - `server_data` volume (covers—can be regenerated)
+  </Step>
+  <Step title="Recovery procedure">
+    1. Restore `.env` file
+    2. Restore PostgreSQL backup
+    3. Restore book directories (if lost)
+    4. Start containers: `docker compose up -d`
+    5. Migrations run automatically on startup
+    6. Trigger full reindex from Bull Board or rescan libraries
+  </Step>
+</Steps>
+
+<Tip>
+  Test your backup and restore procedure regularly to ensure it works when needed.
+</Tip>

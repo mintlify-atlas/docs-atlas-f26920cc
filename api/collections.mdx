@@ -1,0 +1,261 @@
+---
+title: Collections
+description: User collections for organizing books
+---
+
+The collections router allows users to create custom collections and organize their books.
+
+## List collections
+
+Get all collections for the authenticated user.
+
+```typescript
+const collections = await client.collections.list();
+```
+
+### Response
+
+Array of collection objects:
+
+<ResponseField name="id" type="string">
+  Collection UUID
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Collection name
+</ResponseField>
+
+<ResponseField name="description" type="string | null">
+  Collection description
+</ResponseField>
+
+<ResponseField name="isPublic" type="boolean">
+  Whether collection is visible to other users
+</ResponseField>
+
+<ResponseField name="userId" type="string">
+  Owner user ID
+</ResponseField>
+
+<ResponseField name="bookCount" type="number">
+  Number of books in this collection
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO timestamp
+</ResponseField>
+
+## Get collection details
+
+Retrieve a collection with all its books.
+
+```typescript
+const collection = await client.collections.getDetails({
+  collectionId: "collection-uuid",
+});
+```
+
+### Input
+
+<ParamField path="collectionId" type="string" required>
+  Collection UUID
+</ParamField>
+
+### Response
+
+<ResponseField name="collection" type="object">
+  Collection metadata
+</ResponseField>
+
+<ResponseField name="books" type="array">
+  Array of book objects in this collection (same structure as `books.getBookWithMetadata`)
+</ResponseField>
+
+## List book memberships
+
+Get all collections that contain a specific book.
+
+```typescript
+const memberships = await client.collections.listBookMemberships({
+  bookUuid: "book-uuid",
+});
+```
+
+### Input
+
+<ParamField path="bookUuid" type="string" required>
+  Book UUID
+</ParamField>
+
+### Response
+
+Array of collection objects with an additional `inCollection` boolean indicating membership.
+
+## Create collection
+
+Create a new collection, optionally adding a book immediately.
+
+```typescript
+const collection = await client.collections.create({
+  name: "Currently Reading",
+  description: "Books I'm reading right now",
+  isPublic: false,
+  addBookUuid: "book-uuid", // Optional
+});
+```
+
+### Input
+
+<ParamField path="name" type="string" required>
+  Collection name (1-80 characters)
+</ParamField>
+
+<ParamField path="description" type="string">
+  Collection description (max 280 characters)
+</ParamField>
+
+<ParamField path="isPublic" type="boolean" default={false}>
+  Whether collection is visible to other users
+</ParamField>
+
+<ParamField path="addBookUuid" type="string">
+  Optionally add this book to the collection immediately
+</ParamField>
+
+### Response
+
+Created collection object.
+
+## Set book membership
+
+Add or remove a book from a collection.
+
+```typescript
+// Add book to collection
+await client.collections.setBookMembership({
+  collectionId: "collection-uuid",
+  bookUuid: "book-uuid",
+  inCollection: true,
+});
+
+// Remove book from collection
+await client.collections.setBookMembership({
+  collectionId: "collection-uuid",
+  bookUuid: "book-uuid",
+  inCollection: false,
+});
+```
+
+### Input
+
+<ParamField path="collectionId" type="string" required>
+  Collection UUID
+</ParamField>
+
+<ParamField path="bookUuid" type="string" required>
+  Book UUID
+</ParamField>
+
+<ParamField path="inCollection" type="boolean" required>
+  `true` to add book, `false` to remove
+</ParamField>
+
+## Update collection visibility
+
+Change whether a collection is public or private.
+
+```typescript
+await client.collections.updateVisibility({
+  collectionId: "collection-uuid",
+  isPublic: true,
+});
+```
+
+### Input
+
+<ParamField path="collectionId" type="string" required>
+  Collection UUID
+</ParamField>
+
+<ParamField path="isPublic" type="boolean" required>
+  New visibility setting
+</ParamField>
+
+## Delete collection
+
+Delete a collection (does not delete the books).
+
+```typescript
+await client.collections.delete({
+  collectionId: "collection-uuid",
+});
+```
+
+### Input
+
+<ParamField path="collectionId" type="string" required>
+  Collection UUID
+</ParamField>
+
+## Input schemas
+
+The collection input schemas are defined in `packages/api/src/routers/collections/collections.model.ts`:
+
+```typescript
+export const CreateCollectionInput = z.object({
+  name: z.string().trim().min(1).max(80),
+  description: z.string().trim().max(280).optional(),
+  isPublic: z.boolean().default(false),
+  addBookUuid: z.string().optional(),
+});
+
+export const SetBookMembershipInput = z.object({
+  collectionId: z.string().uuid(),
+  bookUuid: z.string(),
+  inCollection: z.boolean(),
+});
+
+export const UpdateCollectionVisibilityInput = z.object({
+  collectionId: z.string().uuid(),
+  isPublic: z.boolean(),
+});
+```
+
+## Example: Collection management UI
+
+```typescript
+import { useState } from "react";
+import { orpc } from "@/utils/orpc";
+
+function CollectionManager({ bookUuid }: { bookUuid: string }) {
+  const { data: memberships } = orpc.collections.listBookMemberships.useQuery({
+    bookUuid,
+  });
+  
+  const setMembership = orpc.collections.setBookMembership.useMutation();
+  
+  const handleToggle = async (collectionId: string, inCollection: boolean) => {
+    await setMembership.mutateAsync({
+      collectionId,
+      bookUuid,
+      inCollection: !inCollection,
+    });
+  };
+  
+  return (
+    <div>
+      <h3>Add to collections</h3>
+      {memberships?.map((collection) => (
+        <label key={collection.id}>
+          <input
+            type="checkbox"
+            checked={collection.inCollection}
+            onChange={() => handleToggle(collection.id, collection.inCollection)}
+          />
+          {collection.name}
+        </label>
+      ))}
+    </div>
+  );
+}
+```

@@ -1,0 +1,288 @@
+---
+title: Monitoring
+description: Monitor Nanahoshi queue processing, container health, and search performance
+---
+
+## Queue monitoring with Bull Board
+
+Nanahoshi exposes a Bull Board dashboard at `/admin/queues/` for real-time queue monitoring.
+
+### Accessing Bull Board
+
+The dashboard is protected by admin authentication:
+
+```typescript
+// apps/server/src/index.ts:46-54
+app.use("/admin/*", async (c, next) => {
+  const session = await auth.api.getSession({
+    headers: c.req.raw.headers,
+  });
+  if (!session?.user || session.user.role !== "admin") {
+    return c.text("Unauthorized", 401);
+  }
+  await next();
+});
+```
+
+<Steps>
+  <Step title="Login as admin">
+    Ensure you're logged in with an admin account
+  </Step>
+  <Step title="Navigate to Bull Board">
+    Visit `http://your-server:3000/admin/queues/`
+  </Step>
+  <Step title="Monitor queues">
+    View active jobs, completed, failed, and delayed jobs across all queues
+  </Step>
+</Steps>
+
+### Monitored queues
+
+Bull Board tracks three BullMQ queues backed by Redis:
+
+<CardGroup cols={3}>
+  <Card title="book-index" icon="magnifying-glass">
+    Full reindex jobs for Elasticsearch synchronization
+  </Card>
+  <Card title="file-events" icon="file">
+    File add/delete events from library scanning
+  </Card>
+  <Card title="cover-color" icon="palette">
+    Cover color extraction for UI theming
+  </Card>
+</CardGroup>
+
+```typescript
+// apps/server/src/index.ts:36-42
+createBullBoard({
+  queues: [
+    new BullMQAdapter(bookIndexQueue),
+    new BullMQAdapter(coverColorQueue),
+    new BullMQAdapter(fileEventQueue),
+  ],
+  serverAdapter,
+});
+```
+
+## Docker logs
+
+### View all container logs
+
+```bash
+bun run infra:logs
+```
+
+This runs:
+
+```bash
+docker compose -f docker-compose.dev.yml --env-file apps/server/.env logs -f
+```
+
+### View specific container logs
+
+<CodeGroup>
+```bash Server
+docker logs -f nanahoshi-v2-server
+```
+
+```bash Postgres
+docker logs -f nanahoshi-v2-postgres
+```
+
+```bash Elasticsearch
+docker logs -f nanahoshi-v2-elasticsearch
+```
+
+```bash Redis
+docker logs -f nanahoshi-v2-redis
+```
+</CodeGroup>
+
+### Filter logs by pattern
+
+```bash
+# Show only worker logs
+docker logs nanahoshi-v2-server 2>&1 | grep "\[Worker\]"
+
+# Show Elasticsearch indexing errors
+docker logs nanahoshi-v2-server 2>&1 | grep "\[ES\]"
+```
+
+## Elasticsearch monitoring
+
+### Cluster health
+
+Check Elasticsearch status:
+
+```bash
+curl http://localhost:9200/_cluster/health?pretty
+```
+
+Expected response:
+
+```json
+{
+  "cluster_name": "docker-cluster",
+  "status": "yellow",
+  "number_of_nodes": 1,
+  "active_primary_shards": 1,
+  "active_shards": 1
+}
+```
+
+<Note>
+  Single-node clusters show `yellow` status because replicas cannot be allocated. This is normal for development.
+</Note>
+
+### Index stats
+
+```bash
+# Check book index size
+curl http://localhost:9200/nanahoshi_books/_stats?pretty
+
+# Count documents
+curl http://localhost:9200/nanahoshi_books/_count?pretty
+```
+
+### Kibana dashboard
+
+Access Kibana at `http://localhost:5602` (development environment only):
+
+```yaml
+# docker-compose.dev.yml:50-59
+kibana:
+  image: docker.elastic.co/kibana/kibana:8.17.10
+  environment:
+    - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+  ports:
+    - "5602:5601"
+```
+
+<Tip>
+  Kibana is not included in production `docker-compose.yml` to reduce resource usage. Add it manually if needed.
+</Tip>
+
+## Health checks
+
+### PostgreSQL
+
+Health check runs every 5 seconds:
+
+```yaml
+# docker-compose.yml:71-75
+healthcheck:
+  test: ["CMD-SHELL", "pg_isready -U postgres"]
+  interval: 5s
+  timeout: 5s
+  retries: 5
+```
+
+Manual check:
+
+```bash
+docker exec nanahoshi-v2-postgres pg_isready -U postgres
+```
+
+### Redis
+
+Health check with authentication:
+
+```yaml
+# docker-compose.yml:82-86
+healthcheck:
+  test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+```
+
+Manual check:
+
+```bash
+docker exec nanahoshi-v2-redis redis-cli -a YOUR_PASSWORD ping
+```
+
+### Server endpoint
+
+The root endpoint returns `OK` for basic health checks:
+
+```typescript
+// apps/server/src/index.ts:247-249
+app.get("/", (c) => {
+  return c.text("OK");
+});
+```
+
+Test:
+
+```bash
+curl http://localhost:3000/
+```
+
+## Worker monitoring
+
+### File event worker
+
+Processes file add/delete events with auto-scaled concurrency:
+
+```typescript
+// packages/api/src/infrastructure/workers/file.event.worker.ts:85-94
+const numCPUs = os.cpus().length;
+const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY) || Math.max(2, numCPUs * 2);
+const LIMITER_MAX = Math.min(CONCURRENCY * 2, 100);
+const LIMITER_DURATION = 1000;
+
+console.log(`[Worker] Starting with concurrency=${CONCURRENCY} (CPUs=${numCPUs})`);
+```
+
+Progress logs every 1000 jobs:
+
+```typescript
+// packages/api/src/infrastructure/workers/file.event.worker.ts:179-184
+fileEventWorker.on("completed", (_job: Job) => {
+  processedCount++;
+  if (processedCount % 1000 === 0) {
+    console.log(`[Worker] Completed ${processedCount} jobs`);
+  }
+});
+```
+
+### Book index worker
+
+Monitors reindexing progress:
+
+```typescript
+// packages/api/src/infrastructure/workers/book.index.worker.ts:105-106
+console.log(`[Worker] Indexed ${processedCount} books (lastId=${lastId})`);
+await job.updateProgress(processedCount);
+```
+
+View progress in Bull Board or check logs:
+
+```bash
+docker logs nanahoshi-v2-server 2>&1 | grep "Indexed"
+```
+
+## Resource usage
+
+### Check container resources
+
+```bash
+docker stats
+```
+
+### Elasticsearch heap size
+
+Configured in `docker-compose.yml`:
+
+```yaml
+environment:
+  - ES_JAVA_OPTS=-Xms512m -Xmx1g
+```
+
+Adjust based on your index size:
+
+```yaml
+environment:
+  - ES_JAVA_OPTS=-Xms1g -Xmx2g  # For larger libraries
+```

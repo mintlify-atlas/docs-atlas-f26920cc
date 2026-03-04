@@ -1,0 +1,406 @@
+---
+title: Reading experience
+description: Built-in EPUB reader, reading progress tracking, bookmarks, and reading statistics
+---
+
+Nanahoshi provides a complete reading experience with an integrated EPUB reader, automatic progress tracking, and reading activity monitoring.
+
+## Reading progress tracking
+
+Reading progress is stored per user and book, tracking position, status, and reading time:
+
+```typescript packages/api/src/routers/reading-progress/reading-progress.model.ts
+table: reading_progress {
+  userId: string;
+  bookId: bigint;
+  ttuBookId: number | null;       // TTU reader book ID
+  exploredCharCount: number;       // Characters read
+  bookCharCount: number;           // Total characters in book
+  readingTimeSeconds: number;      // Cumulative reading time
+  status: string;                  // "reading", "completed", "planning"
+  createdAt: Date;
+  updatedAt: Date;
+}
+```
+
+### Reading statuses
+
+Books can be in different reading states:
+
+```typescript packages/api/src/constants.ts
+export const READING_STATUSES = {
+  PLANNING: "planning",      // Want to read
+  READING: "reading",        // Currently reading
+  COMPLETED: "completed",    // Finished reading
+  ON_HOLD: "on_hold",       // Paused
+  DROPPED: "dropped",        // Stopped reading
+};
+```
+
+## Progress API
+
+The reading progress service provides a simple interface:
+
+```typescript packages/api/src/routers/reading-progress/reading-progress.service.ts
+export const saveProgress = async (
+  userId: string,
+  bookUuid: string,
+  data: {
+    ttuBookId?: number;
+    exploredCharCount?: number;
+    bookCharCount?: number;
+    readingTimeSeconds?: number;
+    status?: string;
+  },
+) => {
+  const bookRecord = await bookRepository.getByUuid(bookUuid);
+  if (!bookRecord) throw new ORPCError("NOT_FOUND", { message: "Book not found" });
+
+  const bookId = Number(bookRecord.id);
+  const existing = await readingProgressRepository.getByUserAndBook(userId, bookId);
+  const previousStatus = existing?.status;
+
+  const result = await readingProgressRepository.upsert(userId, bookId, data);
+
+  // Track status changes as activities
+  if (
+    data.status === READING_STATUSES.READING &&
+    previousStatus !== READING_STATUSES.READING
+  ) {
+    await activityRepository.insert(
+      userId,
+      ACTIVITY_TYPES.STARTED_READING,
+      bookId,
+    );
+  }
+  if (
+    data.status === READING_STATUSES.COMPLETED &&
+    previousStatus !== READING_STATUSES.COMPLETED
+  ) {
+    await activityRepository.insert(
+      userId,
+      ACTIVITY_TYPES.COMPLETED_READING,
+      bookId,
+    );
+  }
+
+  return result;
+};
+```
+
+### Retrieving progress
+
+```typescript
+export const getProgress = async (userId: string, bookUuid: string) => {
+  const bookRecord = await bookRepository.getByUuid(bookUuid);
+  if (!bookRecord) throw new ORPCError("NOT_FOUND");
+
+  return readingProgressRepository.getByUserAndBook(
+    userId,
+    Number(bookRecord.id),
+  );
+};
+
+export const listInProgress = async (userId: string, limit = 20) => {
+  return readingProgressRepository.listInProgress(userId, limit);
+};
+```
+
+## Built-in EPUB reader
+
+Nanahoshi includes a web-based EPUB reader built with React:
+
+```tsx apps/web/src/components/book-reader/reader-iframe.tsx
+export function ReaderIframe({ bookUuid }: { bookUuid: string }) {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  
+  // Sync reading progress
+  useReaderSync({
+    bookUuid,
+    iframeRef,
+    onProgressUpdate: (progress) => {
+      // Save progress to API
+      saveProgressMutation.mutate({
+        bookUuid,
+        exploredCharCount: progress.position,
+        bookCharCount: progress.total,
+        readingTimeSeconds: progress.timeSpent,
+      });
+    },
+  });
+
+  return (
+    <iframe
+      ref={iframeRef}
+      src={`/reader/${bookUuid}`}
+      className="w-full h-full"
+    />
+  );
+}
+```
+
+### Reader synchronization
+
+The reader hook manages bidirectional communication:
+
+```tsx apps/web/src/components/book-reader/use-reader-sync.ts
+export function useReaderSync({
+  bookUuid,
+  iframeRef,
+  onProgressUpdate,
+}: ReaderSyncOptions) {
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data.type === "progress") {
+        onProgressUpdate(event.data.payload);
+      }
+    };
+
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [onProgressUpdate]);
+
+  // Send initial position to reader
+  const { data: progress } = useQuery({
+    queryKey: ["reading-progress", bookUuid],
+    queryFn: () => orpc.readingProgress.get.query({ bookUuid }),
+  });
+
+  useEffect(() => {
+    if (progress && iframeRef.current) {
+      iframeRef.current.contentWindow?.postMessage(
+        { type: "restore-position", payload: { position: progress.exploredCharCount } },
+        "*"
+      );
+    }
+  }, [progress, iframeRef]);
+}
+```
+
+## Reading activities
+
+Important reading events are recorded as activities:
+
+```typescript packages/api/src/constants.ts
+export const ACTIVITY_TYPES = {
+  STARTED_READING: "started_reading",
+  COMPLETED_READING: "completed_reading",
+  LIKED_BOOK: "liked_book",
+  ADDED_TO_COLLECTION: "added_to_collection",
+};
+```
+
+Activities create a timeline of user interactions:
+
+```typescript
+table: activity {
+  id: number;
+  userId: string;
+  activityType: string;      // One of ACTIVITY_TYPES
+  bookId: bigint | null;
+  createdAt: Date;
+}
+```
+
+### Activity tracking
+
+```typescript packages/api/src/routers/profile/profile.repository.ts
+export class ActivityRepository {
+  async insert(
+    userId: string,
+    activityType: string,
+    bookId?: number,
+  ): Promise<void> {
+    await db.insert(activity).values({
+      userId,
+      activityType,
+      bookId: bookId ? BigInt(bookId) : null,
+    });
+  }
+
+  async listRecent(userId: string, limit = 50) {
+    return db
+      .select({
+        id: activity.id,
+        activityType: activity.activityType,
+        createdAt: activity.createdAt,
+        book: {
+          id: book.id,
+          uuid: book.uuid,
+          title: bookMetadata.title,
+          cover: bookMetadata.cover,
+        },
+      })
+      .from(activity)
+      .leftJoin(book, eq(book.id, activity.bookId))
+      .leftJoin(bookMetadata, eq(bookMetadata.bookId, book.id))
+      .where(eq(activity.userId, userId))
+      .orderBy(desc(activity.createdAt))
+      .limit(limit);
+  }
+}
+```
+
+## Reading statistics
+
+Progress data enables rich statistics:
+
+<CardGroup cols={2}>
+  <Card title="Progress percentage" icon="chart-line">
+    Calculate completion: `(exploredCharCount / bookCharCount) * 100`
+  </Card>
+  <Card title="Reading time" icon="clock">
+    Track total time spent reading each book
+  </Card>
+  <Card title="Reading streak" icon="fire">
+    Identify consecutive days with reading activity
+  </Card>
+  <Card title="Books completed" icon="book-open-reader">
+    Count books with `status: "completed"`
+  </Card>
+</CardGroup>
+
+### Example statistics query
+
+```typescript
+// Get reading statistics for a user
+const stats = await db
+  .select({
+    totalBooks: sql<number>`COUNT(DISTINCT book_id)`,
+    booksCompleted: sql<number>`COUNT(DISTINCT book_id) FILTER (WHERE status = 'completed')`,
+    totalReadingTime: sql<number>`SUM(reading_time_seconds)`,
+    avgProgress: sql<number>`AVG(explored_char_count::float / NULLIF(book_char_count, 0))`,
+  })
+  .from(readingProgress)
+  .where(eq(readingProgress.userId, userId));
+```
+
+## Bookmarks (future feature)
+
+The schema supports bookmarks for marking interesting passages:
+
+```typescript
+table: bookmark {
+  id: number;
+  userId: string;
+  bookId: bigint;
+  position: number;          // Character offset or CFI
+  note: string | null;       // Optional annotation
+  createdAt: Date;
+}
+```
+
+<Note>
+Bookmark functionality is planned but not yet implemented in the current version.
+</Note>
+
+## Progress persistence
+
+Reading progress is automatically saved:
+
+- **On position change** - Debounced updates every 5 seconds
+- **On page navigation** - Saved when moving between chapters
+- **On reader close** - Final save when exiting the reader
+- **Status changes** - Immediate save when marking as completed/on hold
+
+### Upsert pattern
+
+The repository uses an upsert to handle both new and existing progress:
+
+```typescript packages/api/src/routers/reading-progress/reading-progress.repository.ts
+async upsert(
+  userId: string,
+  bookId: number,
+  data: Partial<ReadingProgress>,
+) {
+  const [result] = await db
+    .insert(readingProgress)
+    .values({
+      userId,
+      bookId: BigInt(bookId),
+      ...data,
+    })
+    .onConflictDoUpdate({
+      target: [readingProgress.userId, readingProgress.bookId],
+      set: {
+        ...data,
+        updatedAt: new Date(),
+      },
+    })
+    .returning();
+
+  return result;
+}
+```
+
+## Currently reading list
+
+Retrieve books currently being read:
+
+```typescript packages/api/src/routers/reading-progress/reading-progress.repository.ts
+async listInProgress(userId: string, limit = 20) {
+  return db
+    .select({
+      bookId: readingProgress.bookId,
+      exploredCharCount: readingProgress.exploredCharCount,
+      bookCharCount: readingProgress.bookCharCount,
+      readingTimeSeconds: readingProgress.readingTimeSeconds,
+      updatedAt: readingProgress.updatedAt,
+      book: {
+        uuid: book.uuid,
+        filename: book.filename,
+        title: bookMetadata.title,
+        cover: bookMetadata.cover,
+      },
+    })
+    .from(readingProgress)
+    .innerJoin(book, eq(book.id, readingProgress.bookId))
+    .leftJoin(bookMetadata, eq(bookMetadata.bookId, book.id))
+    .where(
+      and(
+        eq(readingProgress.userId, userId),
+        eq(readingProgress.status, READING_STATUSES.READING),
+      ),
+    )
+    .orderBy(desc(readingProgress.updatedAt))
+    .limit(limit);
+}
+```
+
+## Integration example
+
+<CodeGroup>
+
+```typescript Save progress
+await orpc.readingProgress.save.mutate({
+  bookUuid: "abc-123",
+  exploredCharCount: 15420,
+  bookCharCount: 50000,
+  readingTimeSeconds: 3600,
+  status: "reading",
+});
+```
+
+```typescript Get progress
+const progress = await orpc.readingProgress.get.query({
+  bookUuid: "abc-123",
+});
+
+console.log(`Progress: ${(progress.exploredCharCount / progress.bookCharCount * 100).toFixed(1)}%`);
+```
+
+```typescript Mark as completed
+await orpc.readingProgress.save.mutate({
+  bookUuid: "abc-123",
+  status: "completed",
+});
+// Automatically creates COMPLETED_READING activity
+```
+
+```typescript List in-progress books
+const reading = await orpc.readingProgress.listInProgress.query({
+  limit: 10,
+});
+```
+
+</CodeGroup>

@@ -1,0 +1,479 @@
+---
+title: Search
+description: Full-text search powered by Elasticsearch with Japanese language support using Sudachi tokenizer
+---
+
+Nanahoshi provides powerful full-text search capabilities using Elasticsearch. The search system is optimized for Japanese text with the Sudachi analyzer and supports multi-field matching with dynamic boosting.
+
+## Elasticsearch configuration
+
+The search index uses a custom Elasticsearch schema with Japanese language analysis:
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.client.ts
+import { Client, HttpConnection } from "@elastic/elasticsearch";
+import { env } from "@nanahoshi-v2/env/server";
+
+export const esClient = new Client({
+  node: env.ELASTICSEARCH_NODE,
+  Connection: HttpConnection,
+});
+
+const INDEX_NAME = `${env.ELASTICSEARCH_INDEX_PREFIX}_books`;
+```
+
+### Index schema
+
+The schema is defined in `search.schema.json` with custom analyzers:
+
+```json packages/api/src/infrastructure/search/elasticsearch/search.schema.json
+{
+  "settings": {
+    "analysis": {
+      "tokenizer": {
+        "ja_sudachi_tokenizer": {
+          "type": "sudachi_tokenizer",
+          "split_mode": "C",
+          "discard_punctuation": true
+        }
+      },
+      "filter": {
+        "sudachi_baseform": { "type": "sudachi_baseform" },
+        "sudachi_normalizeform": { "type": "sudachi_normalizedform" },
+        "sudachi_reading_katakana": {
+          "type": "sudachi_readingform",
+          "reading_form_type": "surface"
+        },
+        "katakana_to_hiragana": {
+          "type": "icu_transform",
+          "id": "Katakana-Hiragana"
+        }
+      },
+      "char_filter": {
+        "romaji_to_kana": {
+          "type": "mapping",
+          "mappings": [
+            "ka=>か", "ki=>き", "ku=>く",
+            "sha=>しゃ", "chi=>ち", "tsu=>つ"
+            // ... (200+ romaji mappings)
+          ]
+        }
+      },
+      "analyzer": {
+        "ja_surface_index_analyzer": {
+          "type": "custom",
+          "char_filter": ["normalize"],
+          "tokenizer": "ja_sudachi_tokenizer",
+          "filter": ["sudachi_pos_filter", "sudachi_split_search", "lowercase"]
+        },
+        "ja_kana_index_analyzer": {
+          "type": "custom",
+          "char_filter": ["normalize", "romaji_to_kana"],
+          "tokenizer": "ja_sudachi_tokenizer",
+          "filter": [
+            "sudachi_pos_filter",
+            "sudachi_reading_katakana",
+            "katakana_to_hiragana",
+            "sudachi_split_search",
+            "lowercase"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+### Field mappings
+
+Each text field has multiple sub-fields for different matching strategies:
+
+```json
+"title": {
+  "type": "text",
+  "analyzer": "ja_surface_index_analyzer",
+  "search_analyzer": "ja_surface_search_analyzer",
+  "fields": {
+    "keyword": { "type": "keyword" },
+    "baseform": {
+      "type": "text",
+      "analyzer": "ja_baseform_index_analyzer"
+    },
+    "normalized": {
+      "type": "text",
+      "analyzer": "ja_normalized_index_analyzer"
+    },
+    "kana": {
+      "type": "text",
+      "analyzer": "ja_kana_index_analyzer"
+    }
+  }
+}
+```
+
+Authors use nested objects to enable proper highlighting:
+
+```json
+"authors": {
+  "type": "nested",
+  "properties": {
+    "name": {
+      "type": "text",
+      "analyzer": "ja_surface_index_analyzer",
+      "fields": {
+        "keyword": { "type": "keyword" },
+        "baseform": { ... },
+        "normalized": { ... },
+        "kana": { ... }
+      }
+    },
+    "role": { "type": "keyword" }
+  }
+}
+```
+
+## Japanese language support
+
+### Sudachi tokenizer
+
+Nanahoshi uses the **Sudachi** tokenizer (not Kuromoji) for superior Japanese text analysis:
+
+<CardGroup cols={2}>
+  <Card title="Better compound handling" icon="language">
+    Sudachi excels at splitting compound words and proper nouns correctly
+  </Card>
+  <Card title="Multiple tokenization modes" icon="layer-group">
+    Mode C (longest) provides comprehensive coverage for search
+  </Card>
+  <Card title="Dictionary normalization" icon="book">
+    Built-in dictionary for baseform and normalized form variants
+  </Card>
+  <Card title="Reading forms" icon="spell-check">
+    Extracts katakana readings for kana-based search
+  </Card>
+</CardGroup>
+
+### Script detection
+
+The search query builder detects the input script and adjusts field boosting:
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.query.ts
+const KANJI_REGEX = /[\u4E00-\u9FFF\u3400-\u4DBF]/;
+const KANA_REGEX = /[\u3040-\u309F\u30A0-\u30FF]/;
+
+function detectInputScript(query: string): InputScript {
+  if (KANJI_REGEX.test(query)) return "kanji";
+  if (KANA_REGEX.test(query)) return "kana";
+  return "romaji";
+}
+```
+
+### Dynamic field boosting
+
+Boost values change based on detected script:
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.query.ts
+const BOOSTS: Record<InputScript, Record<string, number>> = {
+  kanji: {
+    title: 10,
+    "title.baseform": 5,
+    "title.normalized": 4,
+    "title.kana": 0,           // Skip kana fields for kanji input
+    "authors.name": 8,
+    description: 2,
+    titleRomaji: 0,              // Skip romaji for kanji input
+  },
+  kana: {
+    title: 10,
+    "title.baseform": 5,
+    "title.kana": 3,             // Enable kana fields
+    "authors.name.kana": 3,
+    description: 2,
+  },
+  romaji: {
+    title: 3,                    // Lower boost for surface form
+    "title.kana": 5,             // Prefer kana fields (after romaji->kana conversion)
+    "authors.name.kana": 5,
+    titleRomaji: 8,              // Highest boost for dedicated romaji field
+  },
+};
+```
+
+<Note>
+Romaji queries use the `romaji_to_kana` char filter to convert input like "tokyo" to "とうきょう" before analysis.
+</Note>
+
+## Search API
+
+The search client provides a type-safe interface:
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.types.ts
+export interface SearchBooksRequest {
+  query?: string;
+  exactMatch?: boolean;
+  limit?: number;              // Max 50
+  cursor?: string;             // For pagination
+  sort?: SearchSort;
+  filters?: {
+    languageCode?: string[];
+    publishedDateRange?: { from?: string; to?: string };
+    pageCountRange?: { min?: number; max?: number };
+    authors?: string[];
+    series?: string[];
+    publishers?: string[];
+  };
+}
+
+export type SearchSort = "relevance" | "newest" | "oldest" | "title_asc" | "title_desc";
+
+export interface SearchBooksResponse {
+  books: SearchBookHit[];
+  pagination: {
+    cursor?: string;
+    hasMore: boolean;
+    totalHits: number;
+    totalHitsRelation: "eq" | "gte";
+  };
+}
+```
+
+### Building search queries
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.query.ts
+function buildTextQuery(
+  queryText: string,
+  exactMatch: boolean,
+  script: InputScript,
+): QueryDslQueryContainer {
+  const boosts = BOOSTS[script];
+  const effectiveQuery = exactMatch ? `"${queryText}"` : queryText;
+
+  // Top-level fields query
+  const topLevelFields = TOP_LEVEL_TEXT_FIELDS
+    .filter((f) => (boosts[f] ?? 0) > 0)
+    .map((f) => `${f}^${boosts[f]}`);
+
+  const topLevelQuery: QueryDslQueryContainer = {
+    simple_query_string: {
+      query: effectiveQuery,
+      fields: topLevelFields,
+      default_operator: "and",
+      analyze_wildcard: true,
+    },
+  };
+
+  // Nested author query with inner_hits for highlighting
+  const nestedAuthorQuery: QueryDslQueryContainer = {
+    nested: {
+      path: "authors",
+      query: {
+        simple_query_string: {
+          query: effectiveQuery,
+          fields: authorFields,
+          default_operator: "and",
+        },
+      },
+      inner_hits: {
+        _source: false,
+        highlight: {
+          fields: {
+            "authors.name": {
+              type: "unified",
+              number_of_fragments: 1,
+              pre_tags: ["<em>"],
+              post_tags: ["</em>"],
+            },
+          },
+        },
+      },
+    },
+  };
+
+  return {
+    dis_max: {
+      queries: [topLevelQuery, nestedAuthorQuery],
+      tie_breaker: 0.1,
+    },
+  };
+}
+```
+
+## Indexing books
+
+### Single document indexing
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.client.ts
+export async function indexBook(book: Record<string, unknown>): Promise<void> {
+  await esClient.index({
+    index: INDEX_NAME,
+    id: String(book.id),
+    document: book,
+  });
+}
+```
+
+### Bulk indexing
+
+```typescript
+export async function indexBooksBulk(
+  books: Record<string, unknown>[],
+  chunkSize = 500,
+): Promise<{ indexed: number; errors: number }> {
+  let totalIndexed = 0;
+  let totalErrors = 0;
+
+  for (let i = 0; i < books.length; i += chunkSize) {
+    const chunk = books.slice(i, i + chunkSize);
+    const operations = chunk.flatMap((doc) => [
+      { index: { _index: INDEX_NAME, _id: String(doc.id) } },
+      doc,
+    ]);
+
+    const result = await esClient.bulk({ refresh: false, operations });
+    if (result.errors) {
+      const failed = result.items.filter((item) => item.index?.error);
+      totalErrors += failed.length;
+    }
+    totalIndexed += chunk.length - (result.errors ? failed.length : 0);
+  }
+
+  return { indexed: totalIndexed, errors: totalErrors };
+}
+```
+
+### Automatic indexing
+
+Books are indexed automatically by the file event worker after metadata extraction:
+
+```typescript packages/api/src/infrastructure/workers/file.event.worker.ts
+if (bookInserted) {
+  await bookMetadataService.enrichAndSaveMetadata({
+    bookId: bookInserted.id,
+    uuid: bookInserted.uuid,
+  });
+
+  // Index the new book in ES
+  const esDoc = await fetchBookForIndex(bookInserted.id);
+  if (esDoc) {
+    await indexBook(esDoc).catch((err) =>
+      console.error(`[Worker] ES index failed for book ${bookInserted.id}:`, err)
+    );
+  }
+}
+```
+
+## Schema versioning
+
+The index schema includes a hash for automatic recreation on changes:
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.client.ts
+const schemaPath = resolve(import.meta.dirname, "search.schema.json");
+const schemaContent = readFileSync(schemaPath, "utf-8");
+const schema = JSON.parse(schemaContent);
+const schemaHash = createHash("sha256")
+  .update(schemaContent)
+  .digest("hex")
+  .slice(0, 16);
+
+export async function ensureIndex(): Promise<void> {
+  const exists = await esClient.indices.exists({ index: INDEX_NAME });
+
+  if (!exists) {
+    await esClient.indices.create({
+      index: INDEX_NAME,
+      settings: schema.settings,
+      mappings: {
+        ...schema.mappings,
+        _meta: { schema_hash: schemaHash },
+      },
+    });
+    return;
+  }
+
+  // Check if schema changed
+  const mapping = await esClient.indices.getMapping({ index: INDEX_NAME });
+  const existingHash = mapping[INDEX_NAME]?.mappings?._meta?.schema_hash;
+
+  if (existingHash !== schemaHash) {
+    console.log(`[ES] Schema changed, recreating index`);
+    await recreateIndex();
+  }
+}
+```
+
+<Warning>
+Changing the schema will trigger a full index recreation. Make sure to re-index all books after schema changes.
+</Warning>
+
+## Cursor-based pagination
+
+Search uses `search_after` for efficient deep pagination:
+
+```typescript packages/api/src/infrastructure/search/elasticsearch/search.query.ts
+function encodeCursor(sortValues: unknown[]): string {
+  return Buffer.from(JSON.stringify(sortValues)).toString("base64url");
+}
+
+function decodeCursor(cursor: string): unknown[] {
+  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8"));
+}
+
+export function buildSearchRequest(
+  indexName: string,
+  request: SearchBooksRequest,
+): SearchRequest {
+  const body: SearchRequest = {
+    index: indexName,
+    query,
+    sort,
+    size: limit,
+  };
+
+  if (request.cursor) {
+    body.search_after = decodeCursor(request.cursor);
+  }
+
+  return body;
+}
+```
+
+## Example queries
+
+<CodeGroup>
+
+```typescript Simple text search
+const results = await searchBooks({
+  query: "村上春樹",
+  limit: 20,
+});
+// Automatically detects kanji and boosts appropriate fields
+```
+
+```typescript Romaji search
+const results = await searchBooks({
+  query: "murakami haruki",
+  limit: 20,
+});
+// Converts romaji to kana and searches kana fields
+```
+
+```typescript Filtered search
+const results = await searchBooks({
+  query: "science fiction",
+  filters: {
+    languageCode: ["en", "ja"],
+    pageCountRange: { min: 200, max: 500 },
+    publishedDateRange: { from: "2020-01-01" },
+  },
+  sort: "newest",
+});
+```
+
+```typescript Exact match
+const results = await searchBooks({
+  query: "The Catcher in the Rye",
+  exactMatch: true,
+});
+// Wraps query in quotes for phrase matching
+```
+
+</CodeGroup>

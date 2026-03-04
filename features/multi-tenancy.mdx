@@ -1,0 +1,424 @@
+---
+title: Multi-tenancy
+description: Organizations, workspaces, user-library associations, and better-auth organizations plugin
+---
+
+Nanahoshi is built with multi-tenancy from the ground up. Organizations allow multiple users to share libraries while maintaining proper access control and isolation.
+
+## Architecture overview
+
+The multi-tenancy system uses **better-auth** with the organizations plugin:
+
+```typescript packages/auth/src/index.ts
+import { betterAuth } from "better-auth";
+import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { admin, organization } from "better-auth/plugins";
+
+const authConfig = {
+  database: drizzleAdapter(db, {
+    provider: "pg",
+    schema: schema,
+  }),
+  emailAndPassword: {
+    enabled: true,
+  },
+  plugins: [organization(), admin()],
+} satisfies BetterAuthOptions;
+
+export const auth = betterAuth(authConfig);
+```
+
+<Note>
+The `organization()` plugin from better-auth provides built-in support for multi-tenant organizations with roles, invitations, and member management.
+</Note>
+
+## Organization structure
+
+The better-auth organizations plugin creates these tables:
+
+```typescript packages/db/src/schema/auth.ts
+table: organization {
+  id: string;              // UUID
+  name: string;
+  slug: string | null;     // Unique identifier
+  logo: string | null;
+  createdAt: Date;
+  metadata: JSON | null;   // Custom org data
+}
+
+table: member {
+  id: string;              // UUID
+  organizationId: string;
+  userId: string;
+  role: string;            // "owner", "admin", "member"
+  createdAt: Date;
+}
+
+table: invitation {
+  id: string;              // UUID
+  organizationId: string;
+  email: string;
+  role: string;
+  status: string;          // "pending", "accepted", "expired"
+  expiresAt: Date;
+  inviterId: string;
+}
+```
+
+## Organization roles
+
+Better-auth organizations support three default roles:
+
+<CardGroup cols={3}>
+  <Card title="Owner" icon="crown">
+    Full control over the organization, including deletion and billing
+  </Card>
+  <Card title="Admin" icon="user-shield">
+    Can manage members, libraries, and settings
+  </Card>
+  <Card title="Member" icon="user">
+    Can access organization libraries (read-only or read-write based on permissions)
+  </Card>
+</CardGroup>
+
+## Library-organization association
+
+Libraries are scoped to organizations:
+
+```typescript packages/db/src/schema/general.ts
+table: library {
+  id: number;
+  name: string;
+  organizationId: string;   // Foreign key to organization.id
+  isCronWatch: boolean;
+  isPublic: boolean;
+  createdAt: Date;
+}
+```
+
+### Creating organization-scoped libraries
+
+```typescript packages/api/src/routers/libraries/library.service.ts
+export const createLibrary = async (
+  input: CreateLibraryInput & { paths?: string[] },
+  organizationId: string,
+) => {
+  return await libraryRepository.create(input, organizationId);
+};
+```
+
+The repository enforces the organization association:
+
+```typescript packages/api/src/routers/libraries/library.repository.ts
+async create(
+  input: CreateLibraryInput & { paths?: string[] },
+  organizationId: string,
+): Promise<LibraryComplete> {
+  return db.transaction(async (tx) => {
+    const [created] = await tx
+      .insert(library)
+      .values({
+        ...input,
+        organizationId,  // Scoped to organization
+      })
+      .returning();
+
+    // ... add paths
+
+    return created;
+  });
+}
+```
+
+### Querying organization libraries
+
+```typescript packages/api/src/routers/libraries/library.repository.ts
+async findByOrganization(organizationId: string): Promise<LibraryComplete[]> {
+  const libs = await db
+    .select()
+    .from(library)
+    .where(eq(library.organizationId, organizationId));
+
+  // Fetch paths for each library
+  const result: LibraryComplete[] = [];
+  for (const lib of libs) {
+    const paths = await db
+      .select()
+      .from(libraryPath)
+      .where(eq(libraryPath.libraryId, lib.id));
+    result.push({ ...lib, paths });
+  }
+  return result;
+}
+```
+
+## Authorization middleware
+
+The API uses oRPC procedures with organization context:
+
+```typescript packages/api/src/index.ts
+import { auth } from "@nanahoshi-v2/auth";
+import { createContext } from "./context";
+
+// Protected procedure requires authenticated session
+export const protectedProcedure = publicProcedure.use(async ({ context, next }) => {
+  if (!context.session) {
+    throw new ORPCError("UNAUTHORIZED", { message: "Authentication required" });
+  }
+
+  return next({
+    context: {
+      ...context,
+      user: context.session.user,
+      session: context.session.session,
+    },
+  });
+});
+```
+
+### Context extraction
+
+The context includes organization membership:
+
+```typescript packages/api/src/context.ts
+export async function createContext(request: Request) {
+  const session = await auth.api.getSession({ headers: request.headers });
+
+  // Extract active organization from session or header
+  const organizationId = session?.session?.activeOrganizationId;
+
+  return {
+    session,
+    organizationId,
+  };
+}
+```
+
+## User-library associations
+
+Users can have granular permissions per library:
+
+```typescript
+table: user_library {
+  userId: string;
+  libraryId: number;
+  role: string;            // "viewer", "editor", "admin"
+  createdAt: Date;
+}
+```
+
+<Warning>
+The `user_library` table is reserved for future use. Currently, access is controlled at the organization level through better-auth memberships.
+</Warning>
+
+## Organization switching
+
+Users can be members of multiple organizations:
+
+```tsx apps/web/src/components/org-switcher.tsx
+export function OrgSwitcher() {
+  const { data: orgs } = useQuery({
+    queryKey: ["organizations"],
+    queryFn: () => orpc.organizations.list.query(),
+  });
+
+  const { data: activeOrg } = useQuery({
+    queryKey: ["active-organization"],
+    queryFn: () => orpc.organizations.getActive.query(),
+  });
+
+  const switchOrg = async (orgId: string) => {
+    await orpc.organizations.setActive.mutate({ orgId });
+    // Refresh all queries scoped to organization
+    queryClient.invalidateQueries();
+  };
+
+  return (
+    <Select value={activeOrg?.id} onValueChange={switchOrg}>
+      {orgs?.map((org) => (
+        <SelectItem key={org.id} value={org.id}>
+          {org.name}
+        </SelectItem>
+      ))}
+    </Select>
+  );
+}
+```
+
+## Public vs private libraries
+
+Libraries can be public or private within an organization:
+
+```typescript
+library.isPublic = true;   // All organization members can access
+library.isPublic = false;  // Only specific users with permissions
+```
+
+### Filtering by visibility
+
+```typescript
+const publicLibraries = await db
+  .select()
+  .from(library)
+  .where(
+    and(
+      eq(library.organizationId, orgId),
+      eq(library.isPublic, true)
+    )
+  );
+```
+
+## Book access control
+
+Books inherit access control from their parent library:
+
+```typescript packages/api/src/routers/books/book.repository.ts
+async listRecent(limit = 20, organizationId?: string) {
+  let query = db
+    .select({ /* ... */ })
+    .from(book)
+    .innerJoin(library, eq(library.id, book.libraryId))  // Join to enforce org scope
+    .orderBy(desc(book.createdAt))
+    .limit(limit);
+
+  if (organizationId) {
+    query = query.where(
+      eq(library.organizationId, organizationId),  // Filter by organization
+    ) as typeof query;
+  }
+
+  return query;
+}
+```
+
+## Creating a workspace (organization)
+
+The frontend provides a workspace creation form:
+
+```tsx apps/web/src/components/forms/create-workspace-form.tsx
+export function CreateWorkspaceForm() {
+  const createMutation = useMutation({
+    mutationFn: (data: { name: string; slug: string }) =>
+      orpc.organizations.create.mutate(data),
+    onSuccess: (org) => {
+      // Automatically switch to new organization
+      queryClient.setQueryData(["active-organization"], org);
+      router.push("/dashboard");
+    },
+  });
+
+  return (
+    <Form
+      onSubmit={(values) => createMutation.mutate(values)}
+      schema={CreateWorkspaceSchema}
+    >
+      <Input name="name" label="Workspace name" />
+      <Input name="slug" label="Workspace slug" />
+      <Button type="submit">Create workspace</Button>
+    </Form>
+  );
+}
+```
+
+## Invitation flow
+
+Invite users to join an organization:
+
+<Steps>
+  <Step title="Send invitation">
+    An admin creates an invitation with the user's email and desired role.
+  </Step>
+  <Step title="Email notification">
+    Better-auth sends an invitation email with a secure token.
+  </Step>
+  <Step title="Accept invitation">
+    The user clicks the link and is added to the organization.
+  </Step>
+  <Step title="Access granted">
+    The user can now access all libraries in the organization (based on library visibility and their role).
+  </Step>
+</Steps>
+
+## Setup wizard
+
+New users are guided through organization creation:
+
+```tsx apps/web/src/components/setup-page.tsx
+export function SetupPage() {
+  const { data: session } = useQuery({
+    queryKey: ["session"],
+    queryFn: () => orpc.auth.getSession.query(),
+  });
+
+  const { data: orgs } = useQuery({
+    queryKey: ["organizations"],
+    queryFn: () => orpc.organizations.list.query(),
+    enabled: !!session,
+  });
+
+  // Redirect to create workspace if user has no organizations
+  if (session && orgs?.length === 0) {
+    return <CreateWorkspaceForm />;
+  }
+
+  // Otherwise show workspace selector
+  return <WorkspaceSelector orgs={orgs} />;
+}
+```
+
+## Data isolation
+
+Organization data is completely isolated:
+
+- **Libraries** - Scoped by `library.organizationId`
+- **Books** - Inherit scope through `book.libraryId → library.organizationId`
+- **Collections** - Scoped by `collection.userId` (per-user, not shared)
+- **Reading progress** - Scoped by `reading_progress.userId`
+- **Activities** - Scoped by `activity.userId`
+
+<Note>
+Collections and reading progress are **user-scoped**, not organization-scoped. This means users maintain their personal reading lists and progress even if they switch organizations.
+</Note>
+
+## Example: Multi-tenant query
+
+```typescript
+// Get all books in user's active organization
+const { data: books } = useQuery({
+  queryKey: ["books", "recent", organizationId],
+  queryFn: () => orpc.books.listRecent.query({ limit: 20 }),
+});
+
+// The backend automatically filters by organizationId from context
+```
+
+## Better-auth configuration
+
+Environment variables for multi-tenancy:
+
+```bash
+# Better-auth
+BETTER_AUTH_SECRET=your-secret-key
+BETTER_AUTH_URL=http://localhost:3000
+
+# SMTP for invitation emails
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=noreply@example.com
+SMTP_PASSWORD=your-smtp-password
+SMTP_FROM=Nanahoshi <noreply@example.com>
+```
+
+<AccordionGroup>
+  <Accordion title="Why better-auth?">
+    Better-auth provides type-safe authentication with built-in organization support, eliminating the need for custom role-based access control (RBAC) implementation.
+  </Accordion>
+
+  <Accordion title="Can I self-host everything?">
+    Yes! Nanahoshi including better-auth is completely self-hosted. No external authentication services required.
+  </Accordion>
+
+  <Accordion title="How do I migrate existing users?">
+    Better-auth uses standard bcrypt password hashing. You can import existing user data by inserting into the `user` table with properly hashed passwords.
+  </Accordion>
+</AccordionGroup>

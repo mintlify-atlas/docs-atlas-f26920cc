@@ -1,0 +1,368 @@
+---
+title: Testing
+description: Testing strategy, running tests, and mocking patterns in Nanahoshi
+---
+
+## Testing strategy
+
+Nanahoshi uses **Bun's built-in test runner** (`bun:test`) for fast, infrastructure-free unit tests.
+
+<Info>No infrastructure (database, Redis, Elasticsearch) is required to run tests. All external dependencies are mocked with `mock.module()`.</Info>
+
+### Test organization
+
+Tests live in `__tests__/` directories next to the code they test:
+
+```
+packages/api/src/
+├── modules/
+│   ├── libraryScanner.ts
+│   └── __tests__/
+│       └── libraryScanner.test.ts
+└── routers/
+    └── books/
+        ├── book.repository.ts
+        └── __tests__/
+            └── book.repository.test.ts
+```
+
+### Key test files
+
+<CardGroup cols={2}>
+  <Card title="libraryScanner.test.ts" icon="folder-open">
+    Tests library scanner logic: scan phases, upsert behavior, job creation, scoping by `libraryPathId`.
+  </Card>
+  <Card title="book.repository.test.ts" icon="database">
+    Tests book repository: insert, conflict handling, composite unique key `[libraryId, filehash]`, deletion.
+  </Card>
+</CardGroup>
+
+## Running tests
+
+### All tests
+
+Run all tests in the `packages/api` workspace:
+
+```bash
+bun test packages/api/
+```
+
+### Specific test files
+
+Run individual test suites:
+
+```bash
+# Library scanner tests
+bun test packages/api/src/modules/__tests__/libraryScanner.test.ts
+
+# Book repository tests
+bun test packages/api/src/routers/books/__tests__/book.repository.test.ts
+```
+
+### Watch mode
+
+Run tests in watch mode during development:
+
+```bash
+bun test --watch packages/api/
+```
+
+## Mocking patterns
+
+Nanahoshi tests mock external dependencies using `mock.module()` before dynamically importing the module under test.
+
+### Mocking Drizzle ORM
+
+Drizzle uses a chainable query builder. Mocks return objects whose methods return `this` and resolve to configurable arrays when awaited.
+
+<CodeGroup>
+
+```typescript Example: book.repository.test.ts
+import { beforeEach, describe, expect, mock, test } from "bun:test";
+
+// Mock return values (mutated per-test)
+let insertReturnValue: any[] = [];
+let onConflictConfig: any = null;
+let insertedValues: any = null;
+
+function createInsertChain() {
+  const chain: any = {
+    values: mock((v: any) => {
+      insertedValues = v;
+      return chain;
+    }),
+    onConflictDoNothing: mock((config: any) => {
+      onConflictConfig = config;
+      return chain;
+    }),
+    returning: mock(() => insertReturnValue),
+  };
+  return chain;
+}
+
+const mockInsert = mock(() => createInsertChain());
+
+mock.module("@nanahoshi-v2/db", () => ({
+  db: {
+    insert: mockInsert,
+  },
+}));
+
+// Import module under test AFTER mocks
+const { BookRepository } = await import("../book.repository");
+```
+
+```typescript Example: libraryScanner.test.ts
+import { mock } from "bun:test";
+
+// Track all insert calls
+const insertCalls: { values: any[]; conflictConfig: any }[] = [];
+
+// Simulate select() results
+let selectResults: any[][] = [];
+let selectCallIndex = 0;
+
+function createSelectChain() {
+  const chain: any = {
+    from: mock(() => chain),
+    where: mock(() => chain),
+    // When awaited, return next result from selectResults
+    then: (resolve: any) => {
+      const result = selectResults[selectCallIndex] ?? [];
+      selectCallIndex++;
+      return resolve(result);
+    },
+  };
+  return chain;
+}
+
+mock.module("@nanahoshi-v2/db", () => ({
+  db: {
+    select: mock(() => createSelectChain()),
+    insert: mock(() => createInsertChain()),
+  },
+}));
+```
+
+</CodeGroup>
+
+### Mocking schema exports
+
+<Warning>
+When mocking `@nanahoshi-v2/db/schema/general`, re-export all real schema exports (`...realSchema`) to prevent mock pollution across test files that share the same Bun process.
+</Warning>
+
+```typescript
+const realSchema = await import("@nanahoshi-v2/db/schema/general");
+
+mock.module("@nanahoshi-v2/db/schema/general", () => ({
+  ...realSchema,
+  scannedFile: {
+    path: "path",
+    libraryPathId: "library_path_id",
+    size: "size",
+    status: "status",
+    // ... mock column names
+  },
+}));
+```
+
+### Mocking BullMQ queues
+
+Mock queue methods to capture job data:
+
+```typescript
+const mockAddBulk = mock(() => Promise.resolve());
+
+mock.module("../../infrastructure/queue/queues/file-event.queue", () => ({
+  fileEventQueue: {
+    addBulk: mockAddBulk,
+  },
+}));
+
+// In test:
+expect(mockAddBulk).toHaveBeenCalled();
+const jobs = mockAddBulk.mock.calls[0][0];
+expect(jobs[0].data.libraryId).toBe(1);
+```
+
+### Mocking filesystem
+
+Mock file operations to avoid disk I/O:
+
+```typescript
+import { mock } from "bun:test";
+
+mock.module("fs/promises", () => ({
+  default: {
+    stat: mock(() =>
+      Promise.resolve({
+        size: 1024,
+        mtimeMs: Date.now(),
+      })
+    ),
+  },
+}));
+```
+
+### Mocking fast-glob
+
+Control which files the scanner "finds":
+
+```typescript
+let fgFiles: string[] = [];
+
+mock.module("fast-glob", () => ({
+  default: {
+    stream: mock(() => {
+      let index = 0;
+      return {
+        [Symbol.asyncIterator]: () => ({
+          next: () => {
+            if (index < fgFiles.length) {
+              return Promise.resolve({
+                done: false,
+                value: fgFiles[index++],
+              });
+            }
+            return Promise.resolve({ done: true, value: undefined });
+          },
+        }),
+      };
+    }),
+  },
+}));
+
+// In test:
+fgFiles = ["/library/book1.epub", "/library/book2.epub"];
+await scanPathLibrary("/library", 1, 100);
+```
+
+## Test examples
+
+### Testing conflict resolution
+
+From `book.repository.test.ts`: Verify that the repository targets the composite unique key `[libraryId, filehash]` (not `filehash` alone):
+
+```typescript
+test("create() targets the composite unique [libraryId, filehash]", async () => {
+  const input = {
+    uuid: "test-uuid",
+    filename: "test.epub",
+    filehash: "abc123",
+    libraryId: 1,
+    libraryPathId: 100,
+    relativePath: "test.epub",
+    filesizeKb: 1024,
+    lastModified: new Date().toISOString(),
+  };
+
+  await repo.create(input);
+
+  expect(onConflictConfig).toBeDefined();
+  // Must reference the real Drizzle column objects
+  expect(onConflictConfig.target).toEqual([book.libraryId, book.filehash]);
+});
+```
+
+### Testing scan phases
+
+From `libraryScanner.test.ts`: Verify that Phase 1 uses `onConflictDoUpdate` to reset existing "done" records back to "pending":
+
+```typescript
+test("Phase 1: uses onConflictDoUpdate with (path, libraryPathId) and sets status to pending", async () => {
+  fgFiles = ["/library/book1.epub", "/library/book2.epub"];
+  selectResults = [[], [], [], [], []];
+
+  await scanPathLibrary("/library", 1, 100);
+
+  const firstInsert = insertCalls[0];
+
+  // Must use onConflictDoUpdate (not DoNothing)
+  expect(firstInsert.conflictConfig.type).toBe("update");
+  expect(firstInsert.conflictConfig.target).toEqual([
+    "path",
+    "library_path_id",
+  ]);
+
+  // Every row starts as "pending"
+  for (const val of firstInsert.values) {
+    expect(val.libraryPathId).toBe(100);
+    expect(val.status).toBe("pending");
+  }
+});
+```
+
+### Testing job creation
+
+From `libraryScanner.test.ts`: Verify that created jobs carry `libraryId` and `libraryPathId`:
+
+```typescript
+test("Phase 4: created jobs carry libraryId and libraryPathId", async () => {
+  fgFiles = ["/library/book1.epub"];
+
+  selectResults = [
+    [],
+    [],
+    [],
+    // Phase 4: return one "verified" file
+    [
+      {
+        path: "/library/book1.epub",
+        status: "verified",
+        libraryPathId: 100,
+      },
+    ],
+    [],
+    [],
+  ];
+
+  await scanPathLibrary("/library", 1, 100);
+
+  expect(mockAddBulk).toHaveBeenCalled();
+  const jobs = mockAddBulk.mock.calls[0][0];
+  expect(jobs[0].data.libraryId).toBe(1);
+  expect(jobs[0].data.libraryPathId).toBe(100);
+  expect(jobs[0].data.action).toBe("add");
+});
+```
+
+## Best practices
+
+<AccordionGroup>
+  <Accordion title="Reset mocks in beforeEach">
+    Clear mock state before each test to prevent cross-contamination:
+
+    ```typescript
+    beforeEach(() => {
+      insertCalls.length = 0;
+      selectResults = [];
+      selectCallIndex = 0;
+      mockInsert.mockClear();
+      mockSelect.mockClear();
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="Test one behavior per test">
+    Keep tests focused on a single behavior. Use descriptive test names that explain what is being tested and why.
+  </Accordion>
+
+  <Accordion title="Avoid infrastructure dependencies">
+    Never connect to real databases, Redis, or Elasticsearch in unit tests. Mock all external I/O.
+  </Accordion>
+
+  <Accordion title="Import modules after mocks">
+    Always call `mock.module()` before dynamically importing the module under test:
+
+    ```typescript
+    // ✅ Correct order
+    mock.module("@nanahoshi-v2/db", () => ({ ... }));
+    const { BookRepository } = await import("../book.repository");
+
+    // ❌ Wrong order
+    const { BookRepository } = await import("../book.repository");
+    mock.module("@nanahoshi-v2/db", () => ({ ... }));
+    ```
+  </Accordion>
+</AccordionGroup>

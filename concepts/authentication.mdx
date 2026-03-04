@@ -1,0 +1,509 @@
+---
+title: Authentication and authorization
+description: How Nanahoshi handles authentication, sessions, organizations, and user management with better-auth
+---
+
+Nanahoshi uses **better-auth** for authentication and authorization with support for email/password login, organizations, and role-based access control.
+
+## Better-auth setup
+
+The auth instance is configured in `packages/auth/src/index.ts`.
+
+### Core configuration
+
+```typescript
+import { db } from '@nanahoshi-v2/db';
+import * as schema from '@nanahoshi-v2/db/schema/auth';
+import { env } from '@nanahoshi-v2/env/server';
+import { betterAuth } from 'better-auth';
+import { drizzleAdapter } from 'better-auth/adapters/drizzle';
+import { admin, organization } from 'better-auth/plugins';
+
+const authConfig = {
+  database: drizzleAdapter(db, {
+    provider: 'pg',
+    schema: schema,
+  }),
+  trustedOrigins: [env.CORS_ORIGIN],
+  emailAndPassword: {
+    enabled: true,
+  },
+  plugins: [organization(), admin()],
+};
+
+export const auth = betterAuth(authConfig);
+```
+
+### Cookie configuration
+
+Cookies are configured based on environment:
+
+```typescript
+const isProd = env.ENVIRONMENT === 'production';
+
+const cookieConfig = {
+  sameSite: (isProd ? 'none' : 'lax') as 'none' | 'lax',
+  secure: true,
+  httpOnly: true,
+};
+
+const crossSubDomainCookies =
+  isProd && env.COOKIE_DOMAIN
+    ? { enabled: true, domain: env.COOKIE_DOMAIN }
+    : { enabled: false };
+
+const authConfig = {
+  // ...
+  advanced: {
+    defaultCookieAttributes: cookieConfig,
+    crossSubDomainCookies: crossSubDomainCookies,
+  },
+};
+```
+
+In production with `COOKIE_DOMAIN` set, cookies work across subdomains (e.g., `api.example.com` and `app.example.com`).
+
+### Social providers (optional)
+
+Discord OAuth can be enabled if credentials are provided:
+
+```typescript
+const authConfig = {
+  // ...
+  ...(env.DISCORD_CLIENT_ID && env.DISCORD_CLIENT_SECRET && {
+    socialProviders: {
+      discord: {
+        clientId: env.DISCORD_CLIENT_ID,
+        clientSecret: env.DISCORD_CLIENT_SECRET,
+        scope: ['identify', 'email', 'guilds', 'guilds.members.read'],
+      },
+    },
+  }),
+};
+```
+
+## Database schema
+
+Authentication tables are defined in `packages/db/src/schema/auth.ts`.
+
+### User table
+
+```typescript
+export const user = pgTable('user', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull().unique(),
+  emailVerified: boolean('email_verified').default(false).notNull(),
+  image: text('image'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  role: text('role'),              // Global role: "admin" or null
+  banned: boolean('banned').default(false),
+  banReason: text('ban_reason'),
+  banExpires: timestamp('ban_expires'),
+  isAnonymous: boolean('is_anonymous'),
+  bio: text('bio'),
+});
+```
+
+The `role` field controls global admin access. Regular users have `role: null`.
+
+### Session table
+
+```typescript
+export const session = pgTable('session', {
+  id: text('id').primaryKey(),
+  expiresAt: timestamp('expires_at').notNull(),
+  token: text('token').notNull().unique(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').notNull(),
+  ipAddress: text('ip_address'),
+  userAgent: text('user_agent'),
+  userId: text('user_id')
+    .notNull()
+    .references(() => user.id, { onDelete: 'cascade' }),
+  impersonatedBy: text('impersonated_by'),
+  activeOrganizationId: text('active_organization_id'),  // Current org context
+});
+```
+
+The `activeOrganizationId` tracks which organization the user is currently working in. This is used for multi-tenancy scoping.
+
+### Account table
+
+Accounts link users to authentication providers:
+
+```typescript
+export const account = pgTable('account', {
+  id: text('id').primaryKey(),
+  accountId: text('account_id').notNull(),
+  providerId: text('provider_id').notNull(),  // "credential", "discord", etc.
+  userId: text('user_id')
+    .notNull()
+    .references(() => user.id, { onDelete: 'cascade' }),
+  accessToken: text('access_token'),
+  refreshToken: text('refresh_token'),
+  idToken: text('id_token'),
+  accessTokenExpiresAt: timestamp('access_token_expires_at'),
+  refreshTokenExpiresAt: timestamp('refresh_token_expires_at'),
+  scope: text('scope'),
+  password: text('password'),      // Hashed password for email/password auth
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').notNull(),
+});
+```
+
+For email/password auth, `providerId` is `"credential"` and `password` contains the hashed password.
+
+## Session management
+
+Sessions are extracted from request headers in the oRPC context.
+
+### Context creation
+
+In `packages/api/src/context.ts`:
+
+```typescript
+import { auth } from '@nanahoshi-v2/auth';
+
+export async function createContext({ context }: CreateContextOptions) {
+  const session = await auth.api.getSession({
+    headers: context.req.raw.headers,
+  });
+  return {
+    session,
+    req: context.req.raw,
+  };
+}
+
+export type Context = Awaited<ReturnType<typeof createContext>>;
+```
+
+The session is available in all procedure handlers via `context.session`.
+
+### Session structure
+
+```typescript
+context.session = {
+  user: {
+    id: string,
+    name: string,
+    email: string,
+    role: string | null,  // "admin" or null
+    // ...
+  },
+  session: {
+    id: string,
+    token: string,
+    expiresAt: Date,
+    activeOrganizationId: string | null,
+    // ...
+  },
+};
+```
+
+## Authorization patterns
+
+### Procedure-level protection
+
+Procedures use middleware for authorization checks.
+
+**Public procedures** - No authentication required:
+
+```typescript
+export const publicProcedure = o;
+
+const router = {
+  healthCheck: publicProcedure.handler(() => "OK"),
+};
+```
+
+**Protected procedures** - Requires authenticated user:
+
+```typescript
+const requireAuth = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const protectedProcedure = publicProcedure.use(requireAuth);
+
+const router = {
+  listBooks: protectedProcedure.handler(async ({ context }) => {
+    // context.session.user is guaranteed to exist
+    return await getBooks(context.session.user.id);
+  }),
+};
+```
+
+**Admin procedures** - Requires admin role:
+
+```typescript
+const requireAdmin = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  if (context.session.user.role !== "admin") {
+    throw new ORPCError("FORBIDDEN");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const adminProcedure = publicProcedure.use(requireAdmin);
+```
+
+### Resource-level authorization
+
+Resource access is checked in service or repository layers:
+
+```typescript
+export async function getLibrary(libraryId: number, userId: string) {
+  const library = await db
+    .select()
+    .from(libraryTable)
+    .where(eq(libraryTable.id, libraryId))
+    .limit(1);
+
+  if (!library) {
+    throw new Error('Library not found');
+  }
+
+  // Check if user has access to this library's organization
+  const member = await db
+    .select()
+    .from(memberTable)
+    .where(
+      and(
+        eq(memberTable.organizationId, library.organizationId),
+        eq(memberTable.userId, userId)
+      )
+    )
+    .limit(1);
+
+  if (!member) {
+    throw new Error('Forbidden');
+  }
+
+  return library;
+}
+```
+
+## Organizations
+
+Organizations provide multi-tenancy with isolated content and members.
+
+### Organization table
+
+```typescript
+export const organization = pgTable('organization', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  slug: text('slug').unique(),
+  logo: text('logo'),
+  createdAt: timestamp('created_at').notNull(),
+  metadata: text('metadata'),
+});
+```
+
+### Membership table
+
+Users join organizations through the `member` table:
+
+```typescript
+export const role = pgEnum('role', ['member', 'admin', 'owner']);
+
+export const member = pgTable('member', {
+  id: text('id').primaryKey(),
+  organizationId: text('organization_id')
+    .notNull()
+    .references(() => organization.id, { onDelete: 'cascade' }),
+  userId: text('user_id')
+    .notNull()
+    .references(() => user.id, { onDelete: 'cascade' }),
+  role: text('role').default('member').notNull(),  // "member", "admin", "owner"
+  createdAt: timestamp('created_at').notNull(),
+});
+```
+
+Organization roles:
+- **owner** - Full control, can delete organization
+- **admin** - Can manage members and settings
+- **member** - Basic access to organization content
+
+### Invitation system
+
+New members are invited via email:
+
+```typescript
+export const invitation = pgTable('invitation', {
+  id: text('id').primaryKey(),
+  organizationId: text('organization_id')
+    .notNull()
+    .references(() => organization.id, { onDelete: 'cascade' }),
+  email: text('email').notNull(),
+  role: text('role'),
+  status: text('status').default('pending').notNull(),  // "pending", "accepted"
+  expiresAt: timestamp('expires_at').notNull(),
+  inviterId: text('inviter_id')
+    .notNull()
+    .references(() => user.id, { onDelete: 'cascade' }),
+});
+```
+
+### Organization context
+
+The active organization is stored in the session:
+
+```typescript
+session.activeOrganizationId: string | null
+```
+
+Procedures use this to scope queries:
+
+```typescript
+const router = {
+  getLibraries: protectedProcedure.handler(async ({ context }) => {
+    const orgId = context.session.session.activeOrganizationId;
+    if (!orgId) {
+      throw new ORPCError('BAD_REQUEST', { message: 'No active organization' });
+    }
+    return await getLibraries(orgId);
+  }),
+};
+```
+
+## Auth endpoints
+
+Authentication endpoints are mounted at `/api/auth/*` in the Hono server:
+
+```typescript
+app.on(['POST', 'GET'], '/api/auth/*', (c) => auth.handler(c.req.raw));
+```
+
+Better-auth provides these endpoints automatically:
+
+- `POST /api/auth/sign-up/email` - Register with email/password
+- `POST /api/auth/sign-in/email` - Sign in with email/password
+- `POST /api/auth/sign-out` - Sign out
+- `GET /api/auth/session` - Get current session
+- `POST /api/auth/organization/create` - Create organization
+- `POST /api/auth/organization/set-active` - Switch active organization
+- And many more...
+
+## Frontend integration
+
+The web app uses better-auth's React client in `apps/web/src/lib/auth-client.ts`:
+
+```typescript
+import { createAuthClient } from 'better-auth/react';
+import { organizationClient } from 'better-auth/client/plugins';
+
+export const authClient = createAuthClient({
+  baseURL: import.meta.env.VITE_SERVER_URL,
+  plugins: [organizationClient()],
+});
+```
+
+This provides React hooks:
+
+```typescript
+import { authClient } from '@/lib/auth-client';
+
+function LoginForm() {
+  const { signIn } = authClient.useSignIn();
+
+  const handleSubmit = async (email: string, password: string) => {
+    await signIn.email({
+      email,
+      password,
+    });
+  };
+
+  // ...
+}
+```
+
+### Auth guards
+
+Route protection uses `beforeLoad`:
+
+```typescript
+export const Route = createFileRoute('/dashboard')__({
+  beforeLoad: async ({ context }) => {
+    const session = await authClient.getSession();
+    if (!session?.user) {
+      throw redirect({ to: '/login' });
+    }
+    return { session };
+  },
+});
+```
+
+### Organization switcher
+
+Users can switch between organizations:
+
+```typescript
+import { authClient } from '@/lib/auth-client';
+
+function OrgSwitcher() {
+  const { data: session } = authClient.useSession();
+  const { setActive } = authClient.useOrganization();
+
+  const handleSwitch = async (orgId: string) => {
+    await setActive({ organizationId: orgId });
+    // Session is updated automatically
+  };
+
+  // ...
+}
+```
+
+## Admin dashboard protection
+
+Admin routes like Bull Board require admin role:
+
+```typescript
+app.use('/admin/*', async (c, next) => {
+  const session = await auth.api.getSession({
+    headers: c.req.raw.headers,
+  });
+  if (!session?.user || session.user.role !== 'admin') {
+    return c.text('Unauthorized', 401);
+  }
+  await next();
+});
+```
+
+## Environment variables
+
+Required environment variables for auth in `apps/server/.env`:
+
+```bash
+# Better Auth
+BETTER_AUTH_SECRET=your-secret-key         # Random string for signing tokens
+BETTER_AUTH_URL=http://localhost:3000      # Backend URL
+
+# CORS (must match frontend URL)
+CORS_ORIGIN=http://localhost:3001
+
+# Optional: Cross-subdomain cookies in production
+COOKIE_DOMAIN=.example.com                 # Include leading dot
+ENVIRONMENT=production
+
+# Optional: Discord OAuth
+DISCORD_CLIENT_ID=your-client-id
+DISCORD_CLIENT_SECRET=your-client-secret
+```
+
+See `packages/env/src/server.ts` for the full list of validated variables.

@@ -1,0 +1,343 @@
+---
+title: Core concepts
+description: Understanding Nanahoshi's data model and key concepts
+---
+
+Nanahoshi is a self-hosted digital book library management system that scans filesystem paths for ebooks, extracts metadata, and indexes them for search and discovery.
+
+## Books
+
+Books are the core entity in Nanahoshi. Each book record represents a single ebook file discovered during library scanning.
+
+### Book schema
+
+Books are stored in the `book` table with the following key attributes:
+
+```typescript
+{
+  id: bigint,              // Auto-incrementing primary key
+  uuid: uuid,              // Unique identifier for URLs and downloads
+  filename: text,          // Original filename
+  filehash: text,          // File content hash for deduplication
+  relativePath: text,      // Path relative to library path
+  mediaType: varchar,      // MIME type (epub, pdf, etc.)
+  filesizeKb: bigint,     // File size in kilobytes
+  lastModified: timestamp, // File modification timestamp
+  libraryId: bigint,       // Parent library reference
+  libraryPathId: bigint,   // Specific library path reference
+  userId: text,            // Optional user association
+  createdAt: timestamp
+}
+```
+
+Books use a composite unique constraint on `(libraryId, filehash)` to prevent duplicates within a library while allowing the same file across different libraries.
+
+See the schema definition in `packages/db/src/schema/general.ts:145-198`.
+
+### Book metadata
+
+Rich metadata is stored separately in the `book_metadata` table with a 1:1 relationship:
+
+```typescript
+{
+  bookId: bigint,          // Primary key, references book.id
+  title: varchar,
+  subtitle: varchar,
+  description: text,
+  publishedDate: date,
+  languageCode: varchar,
+  pageCount: integer,
+  isbn10: varchar,
+  isbn13: varchar,
+  asin: varchar,
+  cover: varchar,          // Cover image path
+  amountChars: bigint,     // Character count
+  publisherId: integer,    // References publisher table
+  seriesId: integer,       // References series table
+  titleRomaji: varchar,    // Romanized title for Japanese books
+  mainColor: varchar       // Dominant cover color
+}
+```
+
+Metadata is enriched asynchronously by BullMQ workers after books are discovered.
+
+See `packages/db/src/schema/general.ts:213-252`.
+
+## Libraries
+
+Libraries are collections of filesystem paths that Nanahoshi monitors for ebook files. Each library belongs to an organization and can contain multiple paths.
+
+### Library schema
+
+```typescript
+{
+  id: bigint,
+  name: text,
+  organizationId: text,    // Organization that owns this library
+  isPublic: boolean,       // Whether library is accessible to all org members
+  isCronWatch: boolean,    // Enable automatic periodic scanning
+  createdAt: timestamp
+}
+```
+
+See `packages/db/src/schema/general.ts:60-85`.
+
+### Library paths
+
+Each library can monitor multiple filesystem paths through the `library_path` table:
+
+```typescript
+{
+  id: bigint,
+  libraryId: bigint,
+  path: text,              // Absolute filesystem path
+  isEnabled: boolean,      // Whether this path is actively scanned
+  createdAt: timestamp
+}
+```
+
+The `(libraryId, path)` combination is unique to prevent duplicate path entries.
+
+See `packages/db/src/schema/general.ts:87-115`.
+
+### Scanning workflow
+
+1. User triggers scan via `libraries.scanLibrary` RPC endpoint
+2. Library scanner discovers ebook files (`.epub`, `.pdf`, etc.)
+3. File events are queued to `file-events` BullMQ queue
+4. `file.event.worker` creates book records and extracts basic metadata
+5. Book indexing jobs are queued to `book-index` queue
+6. `book.index.worker` indexes books into Elasticsearch
+
+See the library router at `packages/api/src/routers/libraries/library.router.ts`.
+
+## Collections
+
+Collections are user-created groups of books, similar to playlists. Users can organize their books into custom collections.
+
+### Collection schema
+
+```typescript
+{
+  id: uuid,                // Primary key
+  userId: text,            // Owner of the collection
+  name: text,              // Collection name (unique per user)
+  description: text,
+  isPublic: boolean,       // Whether visible to other users
+  createdAt: timestamp,
+  updatedAt: timestamp
+}
+```
+
+Books are associated with collections through the `collection_book` join table:
+
+```typescript
+{
+  collectionId: uuid,
+  bookId: bigint,
+  addedAt: timestamp
+}
+```
+
+See `packages/db/src/schema/general.ts:287-316` and `440-474`.
+
+### Collection operations
+
+The collections router provides:
+
+- `list` - List user's collections
+- `getDetails` - Get collection with all books
+- `listBookMemberships` - Check which collections contain a specific book
+- `create` - Create new collection
+- `setBookMembership` - Add or remove book from collection
+- `updateVisibility` - Toggle public/private status
+- `delete` - Delete collection
+
+See `packages/api/src/routers/collections/collections.router.ts`.
+
+## Organizations
+
+Organizations provide multi-tenancy. Each organization has its own libraries, members, and content isolation.
+
+### Organization schema
+
+```typescript
+{
+  id: text,                // Primary key
+  name: text,
+  slug: text,              // URL-friendly identifier
+  logo: text,
+  createdAt: timestamp,
+  metadata: text           // JSON metadata
+}
+```
+
+Users join organizations through the `member` table:
+
+```typescript
+{
+  id: text,
+  organizationId: text,
+  userId: text,
+  role: text,              // "member", "admin", or "owner"
+  createdAt: timestamp
+}
+```
+
+See `packages/db/src/schema/auth.ts:79-124`.
+
+### Organization context
+
+The active organization is tracked in the user's session:
+
+```typescript
+session.activeOrganizationId  // Selected org for current session
+```
+
+API procedures use this to scope queries to the correct organization. For example, listing books only returns books from libraries owned by the active organization.
+
+## Metadata entities
+
+### Authors
+
+Authors are shared entities that can be associated with multiple books:
+
+```typescript
+{
+  id: bigint,
+  name: text,
+  description: text,
+  amazonAsin: text,        // Amazon author identifier
+  provider: text,          // Metadata source (Amazon, Google, etc.)
+  createdAt: timestamp
+}
+```
+
+Authors link to books through `book_author` join table with optional roles:
+
+```typescript
+{
+  bookId: bigint,
+  authorId: bigint,
+  role: text              // "author", "translator", "illustrator", etc.
+}
+```
+
+See `packages/db/src/schema/general.ts:268-343`.
+
+### Series
+
+Series group related books:
+
+```typescript
+{
+  id: bigint,
+  name: text,
+  description: text,
+  createdAt: timestamp
+}
+```
+
+Books in a series include position information via `book_series`:
+
+```typescript
+{
+  seriesId: bigint,
+  bookId: bigint,
+  position: integer       // Book number in series
+}
+```
+
+See `packages/db/src/schema/general.ts:254-267` and `345-368`.
+
+### Publishers
+
+```typescript
+{
+  id: bigint,
+  name: text,
+  createdAt: timestamp
+}
+```
+
+Publishers are referenced by `book_metadata.publisherId`.
+
+See `packages/db/src/schema/general.ts:200-211`.
+
+## User interactions
+
+### Reading progress
+
+Nanahoshi tracks reading progress for each user-book combination:
+
+```typescript
+{
+  id: bigint,
+  userId: text,
+  bookId: bigint,
+  exploredCharCount: bigint,    // Characters read
+  bookCharCount: bigint,        // Total characters
+  readingTimeSeconds: integer,  // Time spent reading
+  status: varchar,              // "unread", "reading", "completed"
+  startedAt: timestamp,
+  completedAt: timestamp,
+  lastReadAt: timestamp,
+  createdAt: timestamp
+}
+```
+
+See `packages/db/src/schema/general.ts:399-438`.
+
+### Liked books
+
+Users can like/favorite books:
+
+```typescript
+{
+  userId: text,
+  bookId: bigint,
+  createdAt: timestamp
+}
+```
+
+See `packages/db/src/schema/general.ts:370-397`.
+
+### Activity feed
+
+User activities are logged for social features:
+
+```typescript
+{
+  id: bigint,
+  userId: text,
+  type: activityTypeEnum,      // "started_reading", "completed_reading", "liked_book"
+  bookId: bigint,
+  metadata: jsonb,             // Additional activity data
+  createdAt: timestamp
+}
+```
+
+See `packages/db/src/schema/general.ts:482-508`.
+
+## Scanned files
+
+The `scanned_file` table tracks discovered files before they become books:
+
+```typescript
+{
+  id: serial,
+  path: text,
+  libraryPathId: bigint,
+  size: integer,
+  mtime: timestamp,           // File modification time
+  status: varchar,            // "pending", "processing", "completed", "error"
+  hash: text,                 // File content hash
+  error: text,                // Error message if processing failed
+  createdAt: timestamp,
+  updatedAt: timestamp
+}
+```
+
+This enables tracking of scan state and error handling.
+
+See `packages/db/src/schema/general.ts:31-58`.

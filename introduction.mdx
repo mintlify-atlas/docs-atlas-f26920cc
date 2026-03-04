@@ -1,0 +1,153 @@
+---
+title: Introduction
+description: A modern, self-hosted digital library server for managing and sharing your ebook and audiobook collections
+---
+
+## What is Nanahoshi?
+
+Nanahoshi is a self-hosted, multi-tenant digital library server that helps you organize, manage, and share your book and audiobook collections. Built with modern web technologies, it provides a fast, responsive interface for accessing your digital library from any device.
+
+## Key features
+
+Nanahoshi offers a comprehensive set of features for managing your digital library:
+
+### Full EPUB support with integrated reader
+
+Nanahoshi includes built-in support for reading EPUB files directly in your browser using the ttu-reader component. You can start reading immediately without downloading files to your device.
+
+### Advanced full-text search
+
+Powered by Elasticsearch with Japanese kuromoji tokenizer support, Nanahoshi provides fast, accurate search across your entire library. Search works seamlessly across multiple languages and can find books by title, author, content, or metadata.
+
+### Multi-tenant architecture
+
+Using the better-auth organizations plugin, Nanahoshi supports multiple organizations with isolated libraries. You can manage separate collections for different groups while maintaining a single instance.
+
+### High-performance library scanning
+
+The library scanner uses BullMQ workers to process large collections efficiently. It:
+
+- Scans filesystem paths for ebooks and extracts metadata automatically
+- Indexes content in Elasticsearch for instant search
+- Handles incremental updates when you add new books
+- Processes files in parallel using auto-scaled workers based on CPU count
+
+### Multiple authentication providers
+
+Authentication is handled by better-auth with support for:
+
+- Email and password
+- OAuth providers (Discord and others)
+- Session management with secure cookies
+
+### Responsive design
+
+The React-based frontend is optimized for all screen sizes, from mobile phones to desktop monitors. The interface adapts seamlessly to your device.
+
+## Architecture overview
+
+Nanahoshi is built as a Bun + Turborepo monorepo with a clear separation of concerns:
+
+### Frontend layer
+
+The web application (`apps/web`) uses:
+
+- **TanStack Start** for server-side rendering
+- **TanStack Router** for file-based routing
+- **TanStack Query** for data fetching and caching
+- **Vite** for fast development and optimized production builds
+
+It communicates with the backend via type-safe RPC calls using oRPC.
+
+### Backend layer
+
+The server (`apps/server`) runs on **Hono**, a fast web framework for Bun. It exposes:
+
+- `/rpc/*` - oRPC handler for frontend communication
+- `/api/auth/*` - better-auth authentication endpoints
+- `/api-reference/*` - OpenAPI reference documentation
+- `/admin/queues/` - Bull Board dashboard for monitoring background jobs
+- `/download/:uuid` - Signed URL file downloads
+- `/reader/*` - Embedded ebook reader
+
+### Business logic layer
+
+The API package (`packages/api`) contains:
+
+- **oRPC routers** for type-safe procedures
+- **Services** implementing business logic
+- **Repositories** for database access
+- **BullMQ workers** for background processing:
+  - `file.event.worker` - processes file add/delete events
+  - `book.index.worker` - indexes books into Elasticsearch
+  - `cover-color.worker` - extracts dominant colors from covers
+
+### Data layer
+
+Data persistence uses:
+
+- **PostgreSQL** with the groonga/pgroonga extension for full-text search
+- **Drizzle ORM** for type-safe database access with SQL migrations
+- **Redis** for BullMQ job queues
+- **Elasticsearch** for advanced search indexing
+
+### Package structure
+
+Shared packages provide reusable functionality:
+
+- `packages/auth` - better-auth instance configuration
+- `packages/db` - Drizzle schema and database client
+- `packages/env` - Environment variable validation with Zod
+- `packages/config` - Shared TypeScript and build configuration
+
+## Use cases
+
+### Personal digital library
+
+Organize your personal ebook and audiobook collection with automatic metadata extraction, full-text search, and reading progress tracking.
+
+### Family or team libraries
+
+Create separate organizations for family members or team projects. Each organization maintains its own isolated collection with granular access control.
+
+### Self-hosted reading service
+
+Host your own alternative to commercial ebook platforms. Maintain complete control over your data and reading experience without vendor lock-in.
+
+### Multi-language collections
+
+Manage libraries containing books in multiple languages, including Japanese, with proper tokenization and search support.
+
+## Technology stack
+
+<CardGroup cols={2}>
+  <Card title="Runtime" icon="cube">
+    Bun >= 1.3.1
+  </Card>
+  <Card title="Backend" icon="server">
+    Hono + oRPC + better-auth
+  </Card>
+  <Card title="Frontend" icon="window">
+    React + TanStack Start/Router/Query
+  </Card>
+  <Card title="Database" icon="database">
+    PostgreSQL + Drizzle ORM
+  </Card>
+  <Card title="Search" icon="magnifying-glass">
+    Elasticsearch with kuromoji
+  </Card>
+  <Card title="Queue" icon="list">
+    BullMQ + Redis
+  </Card>
+</CardGroup>
+
+## What's next?
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get Nanahoshi running with Docker in minutes
+  </Card>
+  <Card title="Installation" icon="code" href="/installation">
+    Set up a development environment
+  </Card>
+</CardGroup>

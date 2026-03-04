@@ -1,0 +1,172 @@
+---
+title: API overview
+description: Learn about Nanahoshi's type-safe API architecture built on oRPC
+---
+
+Nanahoshi's API is built on [oRPC](https://orpc.io), a type-safe RPC framework that provides end-to-end TypeScript type safety between the server and client.
+
+## Architecture
+
+The API layer follows a clean architecture pattern:
+
+- **Router** - Defines procedures and input/output schemas using Zod
+- **Service** - Contains business logic
+- **Repository** - Handles database operations via Drizzle ORM
+- **Model** - Defines TypeScript types and Zod schemas
+
+All routers are composed into a single `appRouter` exported from `packages/api/src/routers/index.ts`.
+
+## Base URL
+
+The API is mounted at `/rpc/*` on the server:
+
+```typescript
+const baseUrl = "http://localhost:3000/rpc";
+```
+
+For web clients, this is configured via the `VITE_SERVER_URL` environment variable.
+
+## Type safety
+
+oRPC provides complete type inference from server to client. The frontend imports the `AppRouter` type to get full autocomplete and type checking:
+
+```typescript
+import type { AppRouter } from "@nanahoshi-v2/api/routers/index";
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
+import type { RouterClient } from "@orpc/server";
+
+const link = new RPCLink({
+  url: `${VITE_SERVER_URL}/rpc`,
+  fetch(url, options) {
+    return fetch(url, {
+      ...options,
+      credentials: "include", // Required for session cookies
+    });
+  },
+});
+
+const client: RouterClient<AppRouter> = createORPCClient(link);
+```
+
+## Client usage with TanStack Query
+
+Nanahoshi uses `@orpc/tanstack-query` to integrate oRPC with TanStack Query:
+
+```typescript
+import { createTanstackQueryUtils } from "@orpc/tanstack-query";
+
+const orpc = createTanstackQueryUtils(client);
+
+// Use in components
+function BookList() {
+  const { data, isLoading } = orpc.books.listRecent.useQuery({
+    limit: 20,
+  });
+
+  // data is fully typed!
+}
+
+// Use in route loaders
+const booksRoute = createRoute({
+  path: "/books",
+  beforeLoad: () => ({
+    queryOptions: orpc.books.listRecent.queryOptions({ limit: 20 }),
+  }),
+});
+```
+
+## Request context
+
+Every request includes a context object that provides:
+
+<ResponseField name="session" type="object | null">
+  Better-auth session extracted from request headers. Contains `user` and `session` objects if authenticated.
+</ResponseField>
+
+<ResponseField name="req" type="Request">
+  Raw fetch Request object
+</ResponseField>
+
+The context is created in `packages/api/src/context.ts`:
+
+```typescript
+export async function createContext({ context }: CreateContextOptions) {
+  const session = await auth.api.getSession({
+    headers: context.req.raw.headers,
+  });
+  return {
+    session,
+    req: context.req.raw,
+  };
+}
+```
+
+## Procedure types
+
+Nanahoshi defines three types of procedures in `packages/api/src/index.ts`:
+
+### Public procedure
+
+No authentication required:
+
+```typescript
+export const publicProcedure = o;
+```
+
+### Protected procedure
+
+Requires authenticated session. Throws `UNAUTHORIZED` error if session is missing:
+
+```typescript
+const requireAuth = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const protectedProcedure = publicProcedure.use(requireAuth);
+```
+
+### Admin procedure
+
+Requires authenticated session with `admin` role. Throws `UNAUTHORIZED` or `FORBIDDEN` errors:
+
+```typescript
+const requireAdmin = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  if (context.session.user.role !== "admin") {
+    throw new ORPCError("FORBIDDEN");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const adminProcedure = publicProcedure.use(requireAdmin);
+```
+
+## Available routers
+
+The `appRouter` composes the following routers:
+
+- `admin` - Admin operations (users, organizations, system stats)
+- `books` - Book search, retrieval, and reindexing
+- `collections` - User collections management
+- `files` - File downloads and directory browsing
+- `libraries` - Library management and scanning
+- `readingProgress` - Reading progress tracking
+- `likedBooks` - Book likes/favorites
+- `profile` - User profile management
+- `setup` - Initial setup procedures
+
+See the individual router documentation for detailed endpoint information.

@@ -1,0 +1,554 @@
+---
+title: Troubleshooting
+description: Common issues and solutions for Nanahoshi deployment
+---
+
+## Docker issues
+
+### Containers fail to start
+
+**Symptom:** `docker compose up` exits immediately or containers restart in a loop.
+
+<AccordionGroup>
+  <Accordion title="Check container logs">
+    ```bash
+    docker compose logs server
+    docker compose logs postgres
+    docker compose logs elasticsearch
+    ```
+  </Accordion>
+  
+  <Accordion title="Verify environment variables">
+    Ensure `.env` file exists and contains all required variables:
+    
+    ```bash
+    # Check if .env exists
+    ls -la apps/server/.env
+    
+    # Compare with .env.example
+    diff .env.example apps/server/.env
+    ```
+    
+    Required variables:
+    - `DATABASE_URL`
+    - `NAMESPACE_UUID`
+    - `DOWNLOAD_SECRET`
+    - `BETTER_AUTH_SECRET`
+    - `REDIS_PASSWORD`
+  </Accordion>
+  
+  <Accordion title="Check port conflicts">
+    Default ports: 3000 (server), 3001 (web), 5432 (postgres), 6379 (redis), 9200 (elasticsearch)
+    
+    ```bash
+    # Check if ports are in use
+    sudo lsof -i :3000
+    sudo lsof -i :5432
+    sudo lsof -i :9200
+    ```
+    
+    Override ports in `.env`:
+    
+    ```bash
+    SERVER_PORT=3100
+    WEB_PORT=3101
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Permission errors on volumes
+
+**Symptom:** `permission denied` errors in logs.
+
+```bash
+# Fix volume permissions
+docker compose down
+docker volume rm nanahoshi-v2_postgres_data
+docker volume rm nanahoshi-v2_es_data
+docker volume rm nanahoshi-v2_server_data
+docker compose up -d
+```
+
+<Warning>
+  This deletes all data in the volumes. Backup first if you have existing data.
+</Warning>
+
+### Out of disk space
+
+**Symptom:** `no space left on device`.
+
+```bash
+# Check Docker disk usage
+docker system df
+
+# Clean up unused images, containers, and volumes
+docker system prune -a --volumes
+```
+
+## Database connection issues
+
+### Server cannot connect to PostgreSQL
+
+**Symptom:** Logs show `connection refused` or `ECONNREFUSED`.
+
+<Steps>
+  <Step title="Check PostgreSQL health">
+    ```bash
+    docker exec nanahoshi-v2-postgres pg_isready -U postgres
+    ```
+    
+    Expected output: `postgres:5432 - accepting connections`
+  </Step>
+  
+  <Step title="Verify DATABASE_URL">
+    Ensure `DATABASE_URL` matches the docker-compose service name:
+    
+    ```bash
+    # Correct (production)
+    DATABASE_URL=postgresql://postgres:password@postgres:5432/nanahoshi-v2
+    
+    # Correct (development with local DB)
+    DATABASE_URL=postgresql://postgres:password@localhost:5432/nanahoshi-v2
+    ```
+  </Step>
+  
+  <Step title="Check network connectivity">
+    ```bash
+    docker exec nanahoshi-v2-server ping -c 3 postgres
+    ```
+  </Step>
+</Steps>
+
+### Migration errors
+
+**Symptom:** Server crashes on startup with migration errors.
+
+```typescript
+// Migrations run automatically on startup
+// packages/db/src/migrate.ts called from apps/server/src/index.ts:252
+await runMigrations();
+```
+
+Solutions:
+
+<Tabs>
+  <Tab title="Reset database">
+    ```bash
+    docker exec -it nanahoshi-v2-postgres psql -U postgres -c "DROP DATABASE \"nanahoshi-v2\";"
+    docker exec -it nanahoshi-v2-postgres psql -U postgres -c "CREATE DATABASE \"nanahoshi-v2\";"
+    docker restart nanahoshi-v2-server
+    ```
+  </Tab>
+  
+  <Tab title="Manual migration">
+    ```bash
+    # In development environment
+    bun run db:migrate
+    ```
+  </Tab>
+</Tabs>
+
+## Elasticsearch issues
+
+### Elasticsearch won't start
+
+**Symptom:** Container exits with `max virtual memory areas vm.max_map_count [65530] is too low`.
+
+<CodeGroup>
+```bash Linux
+# Temporarily
+sudo sysctl -w vm.max_map_count=262144
+
+# Permanently
+echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+```bash macOS (Docker Desktop)
+# Add to ~/.docker/daemon.json
+{
+  "vm": {
+    "max_map_count": 262144
+  }
+}
+
+# Restart Docker Desktop
+```
+
+```powershell Windows (WSL2)
+wsl -d docker-desktop
+sysctl -w vm.max_map_count=262144
+```
+</CodeGroup>
+
+### Index creation fails
+
+**Symptom:** Server logs show `[ES] Failed to ensure index on startup`.
+
+```typescript
+// apps/server/src/index.ts:256-259
+await ensureIndex().catch((err: unknown) => {
+  console.warn("[ES] Failed to ensure index on startup:", err);
+});
+```
+
+<Steps>
+  <Step title="Check Elasticsearch health">
+    ```bash
+    curl http://localhost:9200/_cluster/health?pretty
+    ```
+  </Step>
+  
+  <Step title="Recreate index manually">
+    ```bash
+    # Delete existing index
+    curl -X DELETE http://localhost:9200/nanahoshi_books
+    
+    # Restart server to recreate
+    docker restart nanahoshi-v2-server
+    ```
+  </Step>
+  
+  <Step title="Check Elasticsearch logs">
+    ```bash
+    docker logs nanahoshi-v2-elasticsearch
+    ```
+  </Step>
+</Steps>
+
+### Search returns no results
+
+**Symptom:** Books exist in database but search returns empty results.
+
+<AccordionGroup>
+  <Accordion title="Check index document count">
+    ```bash
+    curl http://localhost:9200/nanahoshi_books/_count?pretty
+    ```
+    
+    If count is 0, the index is empty.
+  </Accordion>
+  
+  <Accordion title="Trigger full reindex">
+    1. Access Bull Board: `http://localhost:3000/admin/queues/`
+    2. Navigate to "book-index" queue
+    3. Click "Add job" and submit
+    4. Monitor progress in the jobs list
+    
+    The worker processes in batches of 1000:
+    
+    ```typescript
+    // packages/api/src/infrastructure/workers/book.index.worker.ts:13
+    const BATCH_SIZE = 1000;
+    ```
+  </Accordion>
+  
+  <Accordion title="Check worker logs">
+    ```bash
+    docker logs nanahoshi-v2-server 2>&1 | grep "\[Worker\]"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## File scanning issues
+
+### Library scan finds no files
+
+**Symptom:** Library scan completes but no books are added.
+
+<Steps>
+  <Step title="Check volume mounts">
+    Verify book directories are mounted in `docker-compose.yml`:
+    
+    ```yaml
+    server:
+      volumes:
+        - server_data:/app/apps/server/data
+        - /host/path/to/books:/container/path:ro
+    ```
+  </Step>
+  
+  <Step title="Verify library path configuration">
+    In the admin UI, ensure the library path matches the container path:
+    
+    - Host path: `/home/user/manga`
+    - Container mount: `/home/user/manga:/books/manga:ro`
+    - Library path in UI: `/books/manga`
+  </Step>
+  
+  <Step title="Check file permissions">
+    ```bash
+    # From inside container
+    docker exec nanahoshi-v2-server ls -la /books/manga
+    ```
+  </Step>
+  
+  <Step title="Verify file extensions">
+    Supported formats: `.epub`, `.pdf`, `.cbz`, `.cbr`, `.zip`
+  </Step>
+</Steps>
+
+### Files not processing
+
+**Symptom:** Files detected but stuck in "pending" state.
+
+<AccordionGroup>
+  <Accordion title="Check file-events queue">
+    Access Bull Board: `http://localhost:3000/admin/queues/`
+    
+    Look for:
+    - Failed jobs (red)
+    - Stalled jobs (yellow)
+    - Active jobs (processing)
+  </Accordion>
+  
+  <Accordion title="Check worker concurrency">
+    The file event worker auto-scales based on CPU count:
+    
+    ```typescript
+    // packages/api/src/infrastructure/workers/file.event.worker.ts:86-87
+    const numCPUs = os.cpus().length;
+    const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY) || Math.max(2, numCPUs * 2);
+    ```
+    
+    Override with environment variable:
+    
+    ```yaml
+    server:
+      environment:
+        WORKER_CONCURRENCY: 8
+    ```
+  </Accordion>
+  
+  <Accordion title="Check for errors in logs">
+    ```bash
+    docker logs nanahoshi-v2-server 2>&1 | grep -A 5 "Failed job"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Duplicate books after rescan
+
+**Symptom:** Same book appears multiple times.
+
+**Cause:** Book identity is determined by `filename` + `fileHash`:
+
+```typescript
+// packages/api/src/infrastructure/workers/file.event.worker.ts:114
+uuid: generateDeterministicUUID(filename, fileHash),
+```
+
+If the file was moved or modified, it's treated as a new book.
+
+**Solution:**
+
+1. Check `scanned_file` table for duplicates
+2. Delete duplicate books from the UI
+3. Ensure files are not being moved during scanning
+
+## Worker issues
+
+### Workers not processing jobs
+
+**Symptom:** Jobs pile up in Bull Board but never complete.
+
+<Steps>
+  <Step title="Check Redis connection">
+    ```bash
+    docker exec nanahoshi-v2-redis redis-cli -a YOUR_PASSWORD ping
+    ```
+  </Step>
+  
+  <Step title="Verify workers are registered">
+    Workers are imported as side effects on startup:
+    
+    ```typescript
+    // apps/server/src/index.ts:261-263
+    import "@nanahoshi-v2/api/infrastructure/workers/file.event.worker";
+    import "@nanahoshi-v2/api/infrastructure/workers/book.index.worker";
+    import "@nanahoshi-v2/api/infrastructure/workers/cover-color.worker";
+    ```
+    
+    Check logs for:
+    ```
+    [Worker] Starting with concurrency=X (CPUs=Y)
+    ```
+  </Step>
+  
+  <Step title="Restart server">
+    ```bash
+    docker restart nanahoshi-v2-server
+    ```
+  </Step>
+</Steps>
+
+### Worker memory issues
+
+**Symptom:** Workers crash or server runs out of memory.
+
+```bash
+# Check container memory usage
+docker stats nanahoshi-v2-server
+```
+
+Solutions:
+
+<Tabs>
+  <Tab title="Reduce concurrency">
+    ```yaml
+    server:
+      environment:
+        WORKER_CONCURRENCY: 2  # Lower value
+    ```
+  </Tab>
+  
+  <Tab title="Increase container memory limit">
+    ```yaml
+    server:
+      deploy:
+        resources:
+          limits:
+            memory: 2G
+    ```
+  </Tab>
+  
+  <Tab title="Adjust Elasticsearch heap">
+    ```yaml
+    elasticsearch:
+      environment:
+        - ES_JAVA_OPTS=-Xms256m -Xmx512m  # Lower values
+    ```
+  </Tab>
+</Tabs>
+
+## Authentication issues
+
+### Cannot login
+
+**Symptom:** Login fails with "Invalid credentials" or no error message.
+
+<Steps>
+  <Step title="Check BETTER_AUTH_SECRET">
+    Ensure it's set and hasn't changed since user creation:
+    
+    ```bash
+    docker exec nanahoshi-v2-server printenv BETTER_AUTH_SECRET
+    ```
+  </Step>
+  
+  <Step title="Verify CORS_ORIGIN">
+    Must match the URL you're accessing the web UI from:
+    
+    ```bash
+    # If accessing via http://localhost:3001
+    CORS_ORIGIN=http://localhost:3001
+    
+    # If accessing via https://nanahoshi.example.com
+    CORS_ORIGIN=https://nanahoshi.example.com
+    ```
+  </Step>
+  
+  <Step title="Check session in database">
+    ```bash
+    docker exec -it nanahoshi-v2-postgres psql -U postgres nanahoshi-v2 -c "SELECT * FROM session LIMIT 5;"
+    ```
+  </Step>
+</Steps>
+
+### Email verification not working
+
+**Symptom:** Verification emails not received.
+
+<AccordionGroup>
+  <Accordion title="Check SMTP configuration">
+    Required variables in `.env`:
+    
+    ```bash
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=465
+    SMTP_SECURE=true
+    SMTP_USER=you@gmail.com
+    SMTP_PASS=your-app-password  # Not your regular password!
+    ```
+  </Accordion>
+  
+  <Accordion title="Test SMTP connection">
+    ```bash
+    docker exec -it nanahoshi-v2-server bun -e "import nodemailer from 'nodemailer'; const t = nodemailer.createTransport({host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT), secure: process.env.SMTP_SECURE === 'true', auth: {user: process.env.SMTP_USER, pass: process.env.SMTP_PASS}}); await t.verify(); console.log('SMTP OK');"
+    ```
+  </Accordion>
+  
+  <Accordion title="Check spam folder">
+    Verification emails may be marked as spam. Add SPF/DKIM records if self-hosting.
+  </Accordion>
+</AccordionGroup>
+
+## Performance issues
+
+### Slow search queries
+
+<AccordionGroup>
+  <Accordion title="Check Elasticsearch response times">
+    ```bash
+    curl -X GET "http://localhost:9200/nanahoshi_books/_search?pretty" -H 'Content-Type: application/json' -d'
+    {
+      "query": {"match_all": {}},
+      "size": 20
+    }'
+    ```
+    
+    Look for `took` field (milliseconds).
+  </Accordion>
+  
+  <Accordion title="Increase Elasticsearch heap">
+    ```yaml
+    elasticsearch:
+      environment:
+        - ES_JAVA_OPTS=-Xms1g -Xmx2g
+    ```
+  </Accordion>
+  
+  <Accordion title="Optimize index">
+    ```bash
+    curl -X POST "http://localhost:9200/nanahoshi_books/_forcemerge?max_num_segments=1"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Slow library scans
+
+**Cause:** Worker concurrency too low or disk I/O bottleneck.
+
+```bash
+# Increase worker concurrency
+docker compose down
+# Add to docker-compose.yml:
+server:
+  environment:
+    WORKER_CONCURRENCY: 16  # Adjust based on CPU cores
+
+docker compose up -d
+```
+
+## Getting help
+
+If you're still experiencing issues:
+
+<CardGroup cols={2}>
+  <Card title="Check logs" icon="file-lines">
+    ```bash
+    docker compose logs -f
+    ```
+  </Card>
+  <Card title="Enable debug logging" icon="bug">
+    ```bash
+    ENVIRONMENT=development
+    ```
+  </Card>
+  <Card title="GitHub Issues" icon="github">
+    Search existing issues or create a new one with logs and configuration
+  </Card>
+  <Card title="Community Discord" icon="discord">
+    Join the community for real-time help
+  </Card>
+</CardGroup>

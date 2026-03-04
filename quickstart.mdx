@@ -1,80 +1,250 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get Nanahoshi running with Docker in under 5 minutes
 ---
 
-## Get started in three steps
+This guide will help you deploy Nanahoshi using Docker Compose. You'll have a fully functional digital library server with web interface, database, search, and background workers.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, ensure you have:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- **Docker** and **Docker Compose** installed
+- At least 2GB of available RAM (for Elasticsearch)
+- A directory containing your ebook files (EPUB or other supported formats)
 
-### Step 2: Deploy your changes
+## Installation steps
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Steps>
+  <Step title="Clone the repository">
+    Clone the Nanahoshi repository to your local machine:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    git clone https://github.com/Natsume-197/nanahoshi.git
+    cd nanahoshi
+    ```
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Configure environment variables">
+    Copy the example environment file and edit it with your values:
 
-### Step 3: Go live
+    ```bash
+    cp .env.example .env
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    Open `.env` in your text editor and configure the required variables:
 
-## Next steps
+    ```bash .env
+    # Generate a stable UUID for deterministic book IDs
+    NAMESPACE_UUID=00000000-0000-0000-0000-000000000000  # Replace with: uuidgen
 
-Now that you have your docs running, explore these key features:
+    # Secret for signing download URLs
+    DOWNLOAD_SECRET=00000000-0000-0000-0000-000000000000  # Replace with: uuidgen
+
+    # Authentication secret (min 32 characters)
+    BETTER_AUTH_SECRET=change-me-to-a-random-string-at-least-32-chars  # Replace with: openssl rand -hex 32
+
+    # Email configuration for user invitations and notifications
+    SMTP_HOST=smtp.gmail.com
+    SMTP_PORT=465
+    SMTP_SECURE=true
+    SMTP_USER=you@gmail.com
+    SMTP_PASS=your-app-password
+
+    # Database password
+    POSTGRES_PASSWORD=password  # Change to a secure password
+
+    # Redis password
+    REDIS_PASSWORD=change-me  # Change to a secure password
+
+    # Optional: customize ports
+    SERVER_PORT=3000
+    WEB_PORT=3001
+
+    # Optional: customize search index prefix
+    ELASTICSEARCH_INDEX_PREFIX=nanahoshi
+    ```
+
+    <Note>
+      You can generate secure random values using:
+      - `uuidgen` for UUIDs
+      - `openssl rand -hex 32` for secrets
+    </Note>
+  </Step>
+
+  <Step title="Configure book library volumes">
+    Edit `docker-compose.yml` to mount your book directories. Locate the `server` service and add your book paths under `volumes`:
+
+    ```yaml docker-compose.yml
+    services:
+      server:
+        volumes:
+          - server_data:/app/apps/server/data
+          # Add your book directories here (read-only recommended)
+          - /path/to/your/manga:/books/manga:ro
+          - /path/to/your/novels:/books/novels:ro
+          - /path/to/your/audiobooks:/books/audiobooks:ro
+    ```
+
+    Replace the example paths with your actual book directories. The `:ro` flag mounts them as read-only for safety.
+
+    <Warning>
+      The paths on the left side (`/path/to/your/manga`) are paths on your host machine. The paths on the right side (`/books/manga`) are paths inside the container. You'll use the container paths when creating libraries in the admin UI.
+    </Warning>
+  </Step>
+
+  <Step title="Start the services">
+    Launch all services with Docker Compose:
+
+    ```bash
+    docker compose up -d --build
+    ```
+
+    This command will:
+    - Build the server and web containers
+    - Start PostgreSQL, Redis, and Elasticsearch
+    - Run database migrations automatically
+    - Start background workers for scanning and indexing
+
+    The first startup may take a few minutes as Docker downloads images and builds containers.
+  </Step>
+
+  <Step title="Access Nanahoshi">
+    Once the containers are running, you can access:
+
+    - **Web interface**: http://localhost:3001
+    - **Server API**: http://localhost:3000
+    - **API reference**: http://localhost:3000/api-reference
+
+    <Note>
+      If you customized `SERVER_PORT` or `WEB_PORT` in your `.env` file, use those ports instead.
+    </Note>
+  </Step>
+
+  <Step title="Create your first library">
+    After logging in to the web interface:
+
+    1. Navigate to the admin section
+    2. Create a new library
+    3. Set the library path to match the container mount point (e.g., `/books/manga`)
+    4. Enable automatic scanning if desired
+    5. Save the library
+
+    Nanahoshi will begin scanning your books and extracting metadata. You can monitor the progress in the Bull Board dashboard at http://localhost:3000/admin/queues/.
+  </Step>
+</Steps>
+
+## Verify installation
+
+To verify that all services are running correctly:
+
+```bash
+docker compose ps
+```
+
+You should see five containers running:
+
+- `nanahoshi-v2-server` - Backend API and workers
+- `nanahoshi-v2-web` - Frontend application
+- `nanahoshi-v2-postgres` - PostgreSQL database
+- `nanahoshi-v2-redis` - Redis for job queues
+- `nanahoshi-v2-elasticsearch` - Search indexing
+
+## View logs
+
+If you encounter issues, check the logs:
+
+```bash
+# View all logs
+docker compose logs -f
+
+# View logs for a specific service
+docker compose logs -f server
+docker compose logs -f web
+```
+
+## Stop and restart
+
+To stop Nanahoshi:
+
+```bash
+docker compose down
+```
+
+To restart:
+
+```bash
+docker compose up -d
+```
+
+## Update Nanahoshi
+
+To update to the latest version:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+Database migrations will run automatically on startup.
+
+## Data persistence
+
+Nanahoshi stores persistent data in Docker volumes:
+
+- `postgres_data` - Database tables and user data
+- `es_data` - Elasticsearch search indices
+- `server_data` - Book covers, metadata cache, and application files
+
+These volumes persist even when you stop or restart containers.
+
+<Warning>
+  To completely reset Nanahoshi and delete all data:
+
+  ```bash
+  docker compose down
+  docker volume rm nanahoshi-v2_postgres_data nanahoshi-v2_es_data nanahoshi-v2_server_data
+  ```
+
+  This action is irreversible.
+</Warning>
+
+## Troubleshooting
+
+### Elasticsearch fails to start
+
+Elasticsearch requires at least 2GB of RAM. If you're on Linux, you may also need to increase the `vm.max_map_count` setting:
+
+```bash
+sudo sysctl -w vm.max_map_count=262144
+```
+
+To make this permanent, add it to `/etc/sysctl.conf`.
+
+### Books aren't showing up
+
+Verify that:
+
+1. Your book directories are correctly mounted in `docker-compose.yml`
+2. The library path in the admin UI matches the container mount point (e.g., `/books/manga`)
+3. The scanner worker is running (check logs: `docker compose logs -f server`)
+4. Your book files are in a supported format (EPUB, etc.)
+
+### Can't log in
+
+Check that:
+
+1. `BETTER_AUTH_SECRET` is set in your `.env` file
+2. `SMTP_*` variables are configured correctly for sending email
+3. The database migrations completed successfully (check logs)
+
+## What's next?
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation" icon="code" href="/installation">
+    Set up a development environment to contribute to Nanahoshi
+  </Card>
+  <Card title="Configuration" icon="gear" href="/deployment/configuration">
+    Learn about advanced configuration options
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

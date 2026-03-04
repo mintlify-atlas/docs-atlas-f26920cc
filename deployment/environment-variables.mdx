@@ -1,0 +1,341 @@
+---
+title: Environment variables
+description: Complete reference for all Nanahoshi environment variables
+---
+
+Nanahoshi configuration is managed entirely through environment variables. Copy `.env.example` to `.env` and configure the following:
+
+## General
+
+### DATABASE_URL
+
+**Required** — PostgreSQL connection string.
+
+```bash
+DATABASE_URL=postgresql://postgres:password@localhost:5432/nanahoshi-v2
+```
+
+Format: `postgresql://[user]:[password]@[host]:[port]/[database]`
+
+For Docker Compose, use the service name as host:
+
+```bash
+DATABASE_URL=postgresql://postgres:password@postgres:5432/nanahoshi-v2
+```
+
+### CORS_ORIGIN
+
+**Required** — Allowed origin for CORS requests (web frontend URL).
+
+```bash
+CORS_ORIGIN=http://localhost:3001
+```
+
+For production:
+
+```bash
+CORS_ORIGIN=https://nanahoshi.yourdomain.com
+```
+
+### ENVIRONMENT
+
+**Optional** — Application environment. Defaults to `development`.
+
+```bash
+ENVIRONMENT=development  # or production
+```
+
+### SERVER_URL
+
+**Required** — Base URL where the server is accessible.
+
+```bash
+SERVER_URL=http://localhost:3000
+```
+
+Used for:
+- Generating download links
+- Email template URLs
+- OAuth redirect URIs
+
+### NANAHOSHI_DATA_PATH
+
+**Optional** — Directory for storing covers, thumbnails, and cache. Defaults to `./data`.
+
+```bash
+NANAHOSHI_DATA_PATH=./data
+```
+
+In Docker, this is mounted as a volume at `/app/apps/server/data`.
+
+### NAMESPACE_UUID
+
+**Required** — Stable UUID namespace for generating deterministic book IDs.
+
+```bash
+NAMESPACE_UUID=00000000-0000-0000-0000-000000000000
+```
+
+Generate with:
+
+```bash
+uuidgen
+```
+
+<Warning>
+Do not change this after initial setup. Changing it will regenerate all book UUIDs and break existing links.
+</Warning>
+
+### DOWNLOAD_SECRET
+
+**Required** — Secret key for signing download URLs.
+
+```bash
+DOWNLOAD_SECRET=00000000-0000-0000-0000-000000000000
+```
+
+Generate with:
+
+```bash
+uuidgen
+```
+
+## Authentication
+
+### BETTER_AUTH_SECRET
+
+**Required** — Secret key for signing session tokens. Must be at least 32 characters.
+
+```bash
+BETTER_AUTH_SECRET=change-me-to-a-random-string-at-least-32-chars
+```
+
+Generate with:
+
+```bash
+openssl rand -hex 32
+```
+
+### BETTER_AUTH_URL
+
+**Required** — Base URL for better-auth callbacks. Must match `SERVER_URL`.
+
+```bash
+BETTER_AUTH_URL=http://localhost:3000
+```
+
+### DISCORD_CLIENT_ID
+
+**Optional** — Discord OAuth client ID.
+
+```bash
+DISCORD_CLIENT_ID=your-client-id
+```
+
+Obtain from the [Discord Developer Portal](https://discord.com/developers/applications).
+
+### DISCORD_CLIENT_SECRET
+
+**Optional** — Discord OAuth client secret.
+
+```bash
+DISCORD_CLIENT_SECRET=your-client-secret
+```
+
+<Note>
+Discord OAuth is optional. Users can always register with email/password.
+</Note>
+
+## Web (build-time)
+
+### VITE_SERVER_URL
+
+**Required** — URL the browser uses to reach the API server.
+
+```bash
+VITE_SERVER_URL=http://localhost:3000
+```
+
+This is a **build-time** variable used by Vite. Changes require rebuilding the web frontend:
+
+```bash
+docker compose up -d --build web
+```
+
+For production:
+
+```bash
+VITE_SERVER_URL=https://api.yourdomain.com
+```
+
+## SMTP (email)
+
+SMTP configuration for sending verification emails, password resets, and invitations.
+
+### SMTP_HOST
+
+**Required** — SMTP server hostname.
+
+```bash
+SMTP_HOST=smtp.gmail.com
+```
+
+### SMTP_PORT
+
+**Required** — SMTP server port.
+
+```bash
+SMTP_PORT=465
+```
+
+Common ports:
+- `465` — SSL/TLS (most common)
+- `587` — STARTTLS
+- `25` — Unencrypted (not recommended)
+
+### SMTP_SECURE
+
+**Required** — Use SSL/TLS connection.
+
+```bash
+SMTP_SECURE=true
+```
+
+Set to `true` for port 465, `false` for 587.
+
+### SMTP_USER
+
+**Required** — SMTP authentication username (usually your email).
+
+```bash
+SMTP_USER=you@gmail.com
+```
+
+### SMTP_PASS
+
+**Required** — SMTP authentication password.
+
+```bash
+SMTP_PASS=your-app-password
+```
+
+<Tip>
+For Gmail, generate an [App Password](https://support.google.com/accounts/answer/185833) instead of using your account password.
+</Tip>
+
+## Elasticsearch
+
+### ELASTICSEARCH_NODE
+
+**Required** — Elasticsearch connection URL.
+
+```bash
+ELASTICSEARCH_NODE=http://127.0.0.1:9200
+```
+
+For Docker Compose:
+
+```bash
+ELASTICSEARCH_NODE=http://elasticsearch:9200
+```
+
+### ELASTICSEARCH_INDEX_PREFIX
+
+**Optional** — Prefix for Elasticsearch indices. Defaults to `nanahoshi`.
+
+```bash
+ELASTICSEARCH_INDEX_PREFIX=nanahoshi
+```
+
+The book index will be named `${prefix}_books` (e.g., `nanahoshi_books`).
+
+## Redis
+
+### REDIS_HOST
+
+**Required** — Redis server hostname.
+
+```bash
+REDIS_HOST=127.0.0.1
+```
+
+For Docker Compose:
+
+```bash
+REDIS_HOST=redis
+```
+
+### REDIS_PORT
+
+**Required** — Redis server port.
+
+```bash
+REDIS_PORT=6379
+```
+
+### REDIS_PASSWORD
+
+**Required** — Redis authentication password.
+
+```bash
+REDIS_PASSWORD=change-me
+```
+
+<Warning>
+Generate a strong password for production deployments. Redis is required for BullMQ job queues.
+</Warning>
+
+## Docker Compose only
+
+These variables are only used in `docker-compose.yml` and do not affect bare-metal deployments.
+
+### POSTGRES_PASSWORD
+
+**Required** — Password for the PostgreSQL container.
+
+```bash
+POSTGRES_PASSWORD=password
+```
+
+Must match the password in `DATABASE_URL`.
+
+### SERVER_PORT
+
+**Optional** — Host port to expose the server on. Defaults to `3000`.
+
+```bash
+SERVER_PORT=3000
+```
+
+The server always listens on port 3000 inside the container. This maps it to a different host port:
+
+```yaml
+ports:
+  - "${SERVER_PORT:-3000}:3000"
+```
+
+### WEB_PORT
+
+**Optional** — Host port to expose the web frontend on. Defaults to `3001`.
+
+```bash
+WEB_PORT=3001
+```
+
+## Validation
+
+Environment variables are validated at startup using `@t3-oss/env-core` and Zod in `packages/env/src/server.ts`. Missing or invalid variables will cause the server to exit with an error.
+
+To check your configuration:
+
+```bash
+bun run dev:server
+```
+
+Or in Docker:
+
+```bash
+docker compose logs server
+```
+
+Look for validation errors in the startup logs.

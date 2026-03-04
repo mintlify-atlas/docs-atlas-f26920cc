@@ -1,0 +1,223 @@
+---
+title: Authentication
+description: Authentication endpoints and session handling in Nanahoshi
+---
+
+Nanahoshi uses [better-auth](https://better-auth.com) for authentication, providing email/password authentication with organizations support.
+
+## Better-auth endpoints
+
+All authentication endpoints are mounted at `/api/auth/*` on the server:
+
+```typescript
+// Login
+POST /api/auth/sign-in/email
+
+// Register
+POST /api/auth/sign-up/email
+
+// Sign out
+POST /api/auth/sign-out
+
+// Get session
+GET /api/auth/get-session
+
+// Organization management
+POST /api/auth/organization/create
+POST /api/auth/organization/invite-member
+GET /api/auth/organization/list
+POST /api/auth/organization/set-active
+```
+
+Refer to the [better-auth documentation](https://better-auth.com/docs) for detailed endpoint specifications.
+
+## Session handling
+
+Sessions are stored in cookies and automatically included in all requests when using `credentials: "include"`:
+
+```typescript
+const link = new RPCLink({
+  url: `${VITE_SERVER_URL}/rpc`,
+  fetch(url, options) {
+    return fetch(url, {
+      ...options,
+      credentials: "include", // Required for session cookies
+    });
+  },
+});
+```
+
+### Session context
+
+Every oRPC procedure receives the session in its context:
+
+```typescript
+export async function createContext({ context }: CreateContextOptions) {
+  const session = await auth.api.getSession({
+    headers: context.req.raw.headers,
+  });
+  return {
+    session, // null if not authenticated
+    req: context.req.raw,
+  };
+}
+```
+
+The session object contains:
+
+<ResponseField name="session" type="object | null">
+  <ResponseField name="user" type="object">
+    <ResponseField name="id" type="string">
+      User ID
+    </ResponseField>
+    <ResponseField name="email" type="string">
+      User email
+    </ResponseField>
+    <ResponseField name="role" type="'user' | 'admin'">
+      User role
+    </ResponseField>
+    <ResponseField name="name" type="string | null">
+      User display name
+    </ResponseField>
+    <ResponseField name="emailVerified" type="boolean">
+      Whether email is verified
+    </ResponseField>
+    <ResponseField name="banned" type="boolean">
+      Whether user is banned
+    </ResponseField>
+  </ResponseField>
+  <ResponseField name="session" type="object">
+    <ResponseField name="id" type="string">
+      Session ID
+    </ResponseField>
+    <ResponseField name="userId" type="string">
+      User ID
+    </ResponseField>
+    <ResponseField name="activeOrganizationId" type="string | null">
+      Currently active organization ID
+    </ResponseField>
+    <ResponseField name="expiresAt" type="Date">
+      Session expiration time
+    </ResponseField>
+  </ResponseField>
+</ResponseField>
+
+## Protected procedures
+
+Most API endpoints use `protectedProcedure`, which requires an authenticated session:
+
+```typescript
+const requireAuth = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const protectedProcedure = publicProcedure.use(requireAuth);
+```
+
+If the session is missing, the procedure throws an `UNAUTHORIZED` error:
+
+```json
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Unauthorized"
+  }
+}
+```
+
+## Admin procedures
+
+Some endpoints require admin role using `adminProcedure`:
+
+```typescript
+const requireAdmin = o.middleware(async ({ context, next }) => {
+  if (!context.session?.user) {
+    throw new ORPCError("UNAUTHORIZED");
+  }
+  if (context.session.user.role !== "admin") {
+    throw new ORPCError("FORBIDDEN");
+  }
+  return next({
+    context: {
+      session: context.session,
+    },
+  });
+});
+
+export const adminProcedure = publicProcedure.use(requireAdmin);
+```
+
+Possible errors:
+
+- `UNAUTHORIZED` - No session found
+- `FORBIDDEN` - User is not an admin
+
+## Example: Login flow
+
+```typescript
+// 1. Sign in via better-auth
+const response = await fetch("/api/auth/sign-in/email", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    email: "user@example.com",
+    password: "password123",
+  }),
+  credentials: "include", // Important!
+});
+
+const result = await response.json();
+
+// 2. Session cookie is automatically set
+// 3. All subsequent oRPC calls include the session
+const books = await client.books.listRecent({ limit: 20 });
+// ✓ Authenticated request
+```
+
+## Example: Protected route
+
+```typescript
+import { createRoute } from "@tanstack/react-router";
+import { redirect } from "@tanstack/react-router";
+
+const booksRoute = createRoute({
+  path: "/books",
+  beforeLoad: async ({ context }) => {
+    // Check if user is authenticated
+    const session = await context.orpc.privateData.query();
+    
+    if (!session) {
+      throw redirect({
+        to: "/login",
+        search: {
+          redirect: "/books",
+        },
+      });
+    }
+  },
+});
+```
+
+## Organizations
+
+Nanahoshi supports multi-tenancy via better-auth's organizations plugin. Each library and its books are scoped to an organization.
+
+The active organization is stored in `session.session.activeOrganizationId` and used to filter queries:
+
+```typescript
+listRecent: protectedProcedure
+  .input(z.object({ limit: z.number().int().min(1).max(50).default(20) }).optional())
+  .handler(async ({ input, context }) => {
+    return await bookService.getRecentBooks(
+      input?.limit ?? 20,
+      context.session.session.activeOrganizationId ?? undefined,
+    );
+  }),
+```

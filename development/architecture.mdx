@@ -1,0 +1,286 @@
+---
+title: Architecture
+description: Understanding Nanahoshi's monorepo structure and build system
+---
+
+## Monorepo structure
+
+Nanahoshi uses a **Bun workspaces + Turborepo** monorepo with the following packages:
+
+### Apps
+
+<CardGroup cols={2}>
+  <Card title="apps/server" icon="server">
+    Hono HTTP server. Entry point that wires together API routers, authentication, BullMQ workers, and file downloads.
+  </Card>
+  <Card title="apps/web" icon="browser">
+    TanStack Start/React frontend with file-based routing. Runs on port 3001 during development.
+  </Card>
+</CardGroup>
+
+### Packages
+
+<CardGroup cols={2}>
+  <Card title="packages/api" icon="code">
+    Business logic: oRPC routers, services, repositories, BullMQ workers, and Elasticsearch client.
+  </Card>
+  <Card title="packages/auth" icon="lock">
+    better-auth instance with email+password authentication and organizations plugin.
+  </Card>
+  <Card title="packages/db" icon="database">
+    Drizzle ORM schema and PostgreSQL client. Contains migration files and programmatic migration runner.
+  </Card>
+  <Card title="packages/env" icon="shield">
+    Environment variable validation via `@t3-oss/env-core` + Zod. Separate schemas for server and web.
+  </Card>
+  <Card title="packages/config" icon="gear">
+    Shared TypeScript and build configuration used by all workspaces.
+  </Card>
+</CardGroup>
+
+## Workspace configuration
+
+The root `package.json` defines workspace packages:
+
+```json
+{
+  "workspaces": {
+    "packages": [
+      "apps/*",
+      "packages/*"
+    ]
+  }
+}
+```
+
+### Workspace dependencies
+
+Packages reference each other using `workspace:*` aliases:
+
+```json
+{
+  "dependencies": {
+    "@nanahoshi-v2/api": "workspace:*",
+    "@nanahoshi-v2/db": "workspace:*",
+    "@nanahoshi-v2/env": "workspace:*"
+  }
+}
+```
+
+### Dependency catalog
+
+Shared dependency versions are defined in the root `package.json` under `workspaces.catalog`:
+
+```json
+{
+  "workspaces": {
+    "catalog": {
+      "dotenv": "^17.3.1",
+      "zod": "^4.1.13",
+      "typescript": "^5",
+      "@types/bun": "^1.3.9",
+      "hono": "^4.12.2",
+      "drizzle-orm": "^0.45.1"
+    }
+  }
+}
+```
+
+Packages reference catalog versions with `catalog:`:
+
+```json
+{
+  "dependencies": {
+    "zod": "catalog:",
+    "drizzle-orm": "catalog:"
+  }
+}
+```
+
+## Build system
+
+Turborepo orchestrates builds across the monorepo.
+
+### Development
+
+Run all dev servers in parallel:
+
+```bash
+bun run dev
+```
+
+Under the hood, this runs `turbo dev` which:
+1. Starts `apps/server` in watch mode
+2. Starts `apps/web` in watch mode
+3. Rebuilds dependent packages when their source changes
+
+### Production builds
+
+```bash
+bun run build
+```
+
+Turborepo builds packages in dependency order, caching outputs for unchanged workspaces.
+
+### Scoped commands
+
+Run commands in specific workspaces using Turbo's `-F` (filter) flag:
+
+```bash
+# Run server only
+bun run dev:server
+# Expands to: turbo -F server dev
+
+# Run web only
+bun run dev:web
+# Expands to: turbo -F web dev
+
+# Database commands
+bun run db:generate
+# Expands to: turbo -F @nanahoshi-v2/db db:generate
+```
+
+## API layer
+
+Nanahoshi uses **oRPC** for type-safe RPC procedures.
+
+### Procedure builders
+
+Base procedures are defined in `packages/api/src/index.ts`:
+
+- **`publicProcedure`** — No authentication required
+- **`protectedProcedure`** — Requires authenticated session (throws `UNAUTHORIZED` otherwise)
+
+### Router composition
+
+Routers are composed in `packages/api/src/routers/index.ts` as `appRouter`. Each domain follows the layered pattern:
+
+```
+*.router.ts → *.service.ts → *.repository.ts + *.model.ts
+```
+
+### Request context
+
+Context (`packages/api/src/context.ts`) extracts the better-auth session from request headers on every request.
+
+### Type safety
+
+The frontend imports the `AppRouter` type from `@nanahoshi-v2/api/routers/index`, providing end-to-end type safety between server and client.
+
+## Server endpoints
+
+The Hono app in `apps/server` mounts:
+
+- **`/rpc/*`** — oRPC RPC handler (used by the frontend)
+- **`/api-reference/*`** — OpenAPI reference docs
+- **`/api/auth/*`** — better-auth handler
+- **`/admin/queues/`** — Bull Board dashboard for BullMQ queues
+- **`/download/:uuid`** — Signed URL file download
+
+### Startup sequence
+
+1. `runMigrations()` — Apply pending database migrations
+2. `firstSeed()` — Create default records if needed
+3. Register BullMQ workers:
+   - `file.event.worker` — Processes file add/delete events
+   - `book.index.worker` — Indexes books into Elasticsearch
+
+## Frontend architecture
+
+**TanStack Start** (SSR-capable) + **TanStack Router** (file-based routing).
+
+Route files live in `apps/web/src/routes/`. The auto-generated `routeTree.gen.ts` should not be edited manually.
+
+### oRPC client integration
+
+The oRPC client is wired into TanStack Query via `createTanstackQueryUtils` in `apps/web/src/utils/orpc.ts`.
+
+Use `orpc.<router>.<procedure>.queryOptions(...)` for queries in route loaders and components:
+
+```tsx
+import { orpc } from "~/utils/orpc";
+
+export const Route = createFileRoute("/books")(
+  loader: ({ context }) => {
+    return context.queryClient.ensureQueryData(
+      orpc.books.list.queryOptions({ limit: 20 })
+    );
+  },
+});
+```
+
+### Route context
+
+Route context provides `{ orpc, queryClient }`. Auth guards use `beforeLoad` to check session and redirect to `/login`.
+
+## Infrastructure
+
+Located in `packages/api/src/infrastructure`:
+
+### Queue
+
+**BullMQ** queues (`book-index`, `file-events`) backed by Redis. Workers auto-scale concurrency based on CPU count.
+
+### Search
+
+Elasticsearch client at `infrastructure/search/elasticsearch/search.client.ts`.
+
+- **Index name**: `${ELASTICSEARCH_INDEX_PREFIX}_books`
+- **Analyzer**: kuromoji for Japanese text tokenization
+
+### Workers
+
+Long-running BullMQ workers process background jobs:
+
+- **`file.event.worker`** — Creates book records, triggers metadata enrichment
+- **`book.index.worker`** — Indexes books into Elasticsearch for full-text search
+
+## Database
+
+Drizzle ORM with PostgreSQL (groonga/pgroonga image for full-text search support).
+
+### Schema organization
+
+- `packages/db/src/schema/general.ts` — App tables: `book`, `book_metadata`, `library`, `library_path`, `user_library`, `author`, `series`, `publisher`, `collection`, `collection_book`, `liked_book`, `scanned_file`, `app_settings`
+- `packages/db/src/schema/auth.ts` — better-auth tables (users, sessions, organizations)
+
+### Migrations
+
+- `packages/db/src/migrate.ts` — Programmatic migration runner, called on server startup
+- `packages/db/src/migrations/` — SQL migration files generated by `drizzle-kit generate`
+
+### Schema change workflow
+
+<Steps>
+  <Step title="Edit schema files">
+    Modify tables in `packages/db/src/schema/`.
+  </Step>
+  <Step title="Generate migration">
+    ```bash
+    bun run db:generate
+    ```
+  </Step>
+  <Step title="Commit the migration">
+    Commit the new SQL file in `packages/db/src/migrations/`.
+  </Step>
+  <Step title="Apply on server start">
+    The server automatically applies pending migrations via `runMigrations()`.
+  </Step>
+</Steps>
+
+## Key conventions
+
+<AccordionGroup>
+  <Accordion title="Package manager">
+    Use **Bun** (not npm/yarn). Commands: `bun add`, `bun install`, `bun run`.
+  </Accordion>
+  <Accordion title="Linter and formatter">
+    **Biome** with tabs for indentation and double quotes for JS strings. Run `bun run check` to auto-fix.
+  </Accordion>
+  <Accordion title="Type safety">
+    oRPC provides end-to-end type safety. The frontend imports `AppRouter` type from `@nanahoshi-v2/api/routers/index`.
+  </Accordion>
+  <Accordion title="Environment variables">
+    Server env validated in `packages/env/src/server.ts`. Place variables in `apps/server/.env`.
+  </Accordion>
+</AccordionGroup>

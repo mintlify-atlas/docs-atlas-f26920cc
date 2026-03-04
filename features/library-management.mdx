@@ -1,0 +1,303 @@
+---
+title: Library management
+description: Create libraries, scan filesystem paths, detect file changes, and process books with the library scanner
+---
+
+Nanahoshi organizes your ebooks into **libraries**. Each library can contain multiple filesystem paths that are scanned for ebook files. The library scanner detects new files, updates, and deletions, then processes them through a queue-based pipeline.
+
+## Library structure
+
+Libraries consist of two main components:
+
+- **Library** - A named container scoped to an organization
+- **Library paths** - One or more filesystem directories to scan
+
+```typescript
+interface Library {
+  id: number;
+  name: string;
+  organizationId: string;
+  isCronWatch: boolean;  // Enable automatic scheduled scans
+  isPublic: boolean;     // Make library visible to organization members
+  createdAt: Date;
+}
+
+interface LibraryPath {
+  id: number;
+  libraryId: number;
+  path: string;          // Absolute filesystem path
+  isEnabled: boolean;
+  createdAt: Date;
+}
+```
+
+## Creating a library
+
+Libraries are created with an initial set of filesystem paths:
+
+```typescript packages/api/src/routers/libraries/library.service.ts
+export const createLibrary = async (
+  input: CreateLibraryInput & { paths?: string[] },
+  organizationId: string,
+) => {
+  return await libraryRepository.create(input, organizationId);
+};
+```
+
+The repository handles the transaction:
+
+```typescript packages/api/src/routers/libraries/library.repository.ts
+async create(
+  input: CreateLibraryInput & { paths?: string[] },
+  organizationId: string,
+): Promise<LibraryComplete> {
+  return db.transaction(async (tx) => {
+    const { paths, ...libraryInput } = input;
+    const [created] = await tx
+      .insert(library)
+      .values({ ...libraryInput, organizationId })
+      .returning();
+
+    if (paths?.length) {
+      await tx.insert(libraryPath).values(
+        paths.map((path) => ({
+          libraryId: created.id,
+          path,
+          isEnabled: true,
+        })),
+      );
+    }
+
+    return { ...created, paths: createdPaths };
+  });
+}
+```
+
+## Library scanner
+
+The library scanner is a multi-phase process that efficiently detects files, identifies duplicates, and creates processing jobs.
+
+### Scanning phases
+
+The scanner runs in 5 phases:
+
+<Steps>
+  <Step title="Phase 1: Scan file metadata">
+    Walks the directory tree using `fast-glob` and generates metadata hashes based on file stats (size, mtime). Batch inserts to `scanned_file` table.
+  </Step>
+  <Step title="Phase 1.5: Detect missing files">
+    Compares the current scan with database records to find files that no longer exist. Creates delete jobs for missing files.
+  </Step>
+  <Step title="Phase 2: Find potential duplicates">
+    Identifies files with identical metadata hashes that might be duplicates.
+  </Step>
+  <Step title="Phase 3: Verify duplicates with content hash">
+    Calculates SHA-256 content hashes for potential duplicates in parallel batches (50 files at a time).
+  </Step>
+  <Step title="Phase 4: Create processing jobs">
+    Generates file-event jobs for all verified unique files. Jobs are added to the BullMQ queue in batches of 10,000.
+  </Step>
+</Steps>
+
+### Scanner implementation
+
+The scanner is implemented in `packages/api/src/modules/libraryScanner.ts`:
+
+```typescript packages/api/src/modules/libraryScanner.ts
+export async function scanPathLibrary(
+  rootDir: string,
+  libraryId: number,
+  libraryPathId: number,
+) {
+  console.log(`≫ Starting path library scan for ${rootDir}`);
+
+  // Phase 1: Scan file metadata
+  const entries = fg.stream(["**/*"], {
+    cwd: rootDir,
+    absolute: true,
+    onlyFiles: true,
+  });
+
+  for await (const fullPath of entries) {
+    const stats = await fs.stat(fullPath.toString());
+    const metadataHash = calculateMetadataHash(stats);
+
+    batchFilesDb.push({
+      path: fullPath.toString(),
+      libraryPathId,
+      size: stats.size,
+      mtime: new Date(stats.mtimeMs),
+      status: "pending",
+      hash: metadataHash,
+    });
+
+    if (batchFilesDb.length >= DB_BATCH_SIZE) {
+      await upsertScannedFiles(batchFilesDb);
+      batchFilesDb = [];
+    }
+  }
+}
+```
+
+### Duplicate detection
+
+The scanner identifies duplicates in two steps:
+
+1. **Metadata-based detection** - Groups files by metadata hash (fast)
+2. **Content-based verification** - Calculates SHA-256 for potential duplicates
+
+```typescript packages/api/src/modules/libraryScanner.ts
+async function verifyDuplicatesWithContent(files: any[]) {
+  for (let i = 0; i < files.length; i += PARALLEL_CONTENT_HASH) {
+    const chunk = files.slice(i, i + PARALLEL_CONTENT_HASH);
+
+    await Promise.all(
+      chunk.map(async (file) => {
+        const contentHash = await calculateContentHash(file.path, file.size);
+        if (contentHash) {
+          await db.update(scannedFile)
+            .set({ hash: contentHash })
+            .where(eq(scannedFile.path, file.path));
+        }
+      }),
+    );
+  }
+}
+```
+
+The first file in each duplicate group is kept as the primary; others are marked with `status: "duplicate"` and excluded from processing.
+
+## File event queue
+
+Scanned files are processed asynchronously using BullMQ:
+
+```typescript packages/api/src/infrastructure/queue/queues/file-event.queue.ts
+import { Queue } from "bullmq";
+import { redis } from "../redis";
+
+export const fileEventQueue = new Queue("file-events", {
+  connection: redis,
+});
+```
+
+Each job contains:
+
+```typescript
+interface FileEventJob {
+  action: "add" | "delete";
+  path: string;
+  filename: string;
+  relativePath: string;
+  libraryId: number;
+  libraryPathId: number;
+  fileHash?: string;
+  mtime?: number;
+  size?: number;
+}
+```
+
+### File event worker
+
+The worker processes file events with auto-scaling concurrency based on CPU count:
+
+```typescript packages/api/src/infrastructure/workers/file.event.worker.ts
+const numCPUs = os.cpus().length;
+const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY) || Math.max(2, numCPUs * 2);
+
+export const fileEventWorker = new Worker(
+  "file-events",
+  async (job) => {
+    const { action, filename, fileHash, path, libraryId, libraryPathId } = job.data;
+
+    if (action === "add") {
+      const bookInserted = await bookRepository.create({
+        uuid: generateDeterministicUUID(filename, fileHash),
+        filename,
+        filehash: fileHash,
+        libraryId,
+        libraryPathId,
+        // ...
+      });
+
+      if (bookInserted) {
+        await bookMetadataService.enrichAndSaveMetadata({
+          bookId: bookInserted.id,
+          uuid: bookInserted.uuid,
+        });
+
+        // Index in Elasticsearch
+        const esDoc = await fetchBookForIndex(bookInserted.id);
+        if (esDoc) await indexBook(esDoc);
+      }
+    } else if (action === "delete") {
+      const existing = await bookRepository.getByRelativePath(relativePath, libraryPathId);
+      await bookRepository.removeBookByRelativePath(relativePath, libraryPathId);
+      if (existing) await deleteBook(String(existing.id));
+    }
+  },
+  { connection: redis, concurrency: CONCURRENCY },
+);
+```
+
+## Scanning a library
+
+To trigger a manual scan:
+
+```typescript packages/api/src/routers/libraries/library.service.ts
+export const scanLibrary = async (libraryId: number) => {
+  const library = await libraryRepository.findById(libraryId);
+  if (!library) throw new ORPCError("NOT_FOUND");
+
+  // Scan all paths asynchronously
+  (async () => {
+    for (const pathObj of library.paths) {
+      await scanPathLibrary(pathObj.path, library.id, pathObj.id);
+    }
+  })();
+
+  return { success: true, message: "Library scan started" };
+};
+```
+
+<Note>
+The scan runs asynchronously - the API returns immediately while scanning continues in the background.
+</Note>
+
+## Managing library paths
+
+Add or remove paths from an existing library:
+
+```typescript
+// Add a path
+export const addPath = async (libraryId: number, path: string) => {
+  return await libraryRepository.addPath({
+    libraryId,
+    path,
+    isEnabled: true,
+  });
+};
+
+// Remove a path
+export const removePath = async (pathId: number) => {
+  const deleted = await libraryRepository.removePath(pathId);
+  if (!deleted) throw new ORPCError("NOT_FOUND");
+  return { success: true };
+};
+```
+
+## Performance characteristics
+
+<AccordionGroup>
+  <Accordion title="Scanning performance">
+    - Phase 1 processes **~1,000-5,000 files/sec** (metadata scanning)
+    - Phase 2 content hashing runs with **50 parallel workers**
+    - Batch sizes: 10,000 for database inserts, 10,000 for job creation
+    - The scanner logs progress every batch for visibility
+  </Accordion>
+
+  <Accordion title="Worker scaling">
+    - Concurrency defaults to `numCPUs * 2` (minimum 2)
+    - Rate limited to prevent overwhelming downstream services
+    - Override with `WORKER_CONCURRENCY` environment variable
+  </Accordion>
+</AccordionGroup>

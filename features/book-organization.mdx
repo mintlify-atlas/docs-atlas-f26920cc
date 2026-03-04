@@ -1,0 +1,364 @@
+---
+title: Book organization
+description: Extract metadata from ebooks, manage authors, series, publishers, and organize books into collections
+---
+
+Nanahoshi automatically extracts metadata from ebook files and provides rich organizational features including authors, series, publishers, and user-created collections.
+
+## Book metadata
+
+Metadata is stored separately from book records to allow multiple books to share common entities:
+
+```typescript packages/api/src/routers/books/metadata/book.metadata.model.ts
+export const MetadataInfoSchema = z.object({
+  title: z.string().nullable().optional(),
+  titleRomaji: z.string().nullable().optional(),
+  subtitle: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  publishedDate: z.string().nullable().optional(),
+  languageCode: z.string().nullable().optional(),
+  pageCount: z.number().int().nullable().optional(),
+  isbn10: z.string().nullable().optional(),
+  isbn13: z.string().nullable().optional(),
+  asin: z.string().nullable().optional(),
+  cover: z.string().nullable(),
+  amountChars: z.number().nullable().optional(),
+  authors: z.array(AuthorSchema).nullable().optional(),
+  publisher: PublisherSchema.optional(),
+});
+
+export const AuthorSchema = z.object({
+  name: z.string(),
+  role: z.string().nullable().optional(),
+});
+
+export const PublisherSchema = z.object({
+  name: z.string(),
+});
+```
+
+## Metadata extraction
+
+Metadata is extracted using a provider-based architecture. Currently, the local provider extracts data from EPUB files:
+
+```typescript packages/api/src/routers/books/metadata/metadata.service.ts
+export class BookMetadataService {
+  private providers: IMetadataProvider[] = [localProvider];
+
+  async enrichAndSaveMetadata(
+    input: Partial<BookMetadata> & { bookId: bigint; uuid: string },
+  ) {
+    const metadata = await this.getCompleteMetadata(input);
+    if (Object.keys(metadata).length === 0) return null;
+
+    // 1. Publisher
+    let publisherId: number | undefined;
+    const publisherName = typeof metadata.publisher === "string"
+      ? metadata.publisher
+      : metadata.publisher?.name;
+    if (publisherName) {
+      publisherId = await bookMetadataRepository.upsertPublisher(publisherName);
+    }
+
+    // 2. Save base metadata
+    const toSave: Record<string, unknown> = { ...metadata, publisherId };
+    delete toSave.publisher;
+    delete toSave.authors;
+
+    let saved = null;
+    if (Object.keys(toSave).length) {
+      saved = await bookMetadataRepository.upsertMetadata(input.bookId, toSave);
+    }
+
+    // 3. Authors
+    if (metadata.authors && metadata.authors.length > 0) {
+      await Promise.all(
+        metadata.authors.map(async (author: Author) => {
+          const authorId = await bookMetadataRepository.upsertAuthor(
+            author.name,
+            "LOCAL",
+          );
+          await bookMetadataRepository.linkBookAuthor(input.bookId, authorId);
+        }),
+      );
+    }
+
+    // 4. Enqueue cover color extraction (non-blocking)
+    if (metadata.cover) {
+      await coverColorQueue.add("extract", {
+        bookId: Number(input.bookId),
+        coverPath: metadata.cover,
+      });
+    }
+
+    return saved;
+  }
+
+  private async getCompleteMetadata(
+    input: Partial<BookMetadata>,
+  ): Promise<Partial<BookMetadata>> {
+    let combined: Partial<BookMetadata> = { ...input };
+    for (const provider of this.providers) {
+      const result = await provider.getMetadata(combined);
+      combined = this.mergeMetadata(combined, result);
+    }
+    return combined;
+  }
+}
+```
+
+<Note>
+The metadata service uses a **provider pattern** that allows adding future providers for external metadata sources (e.g., Google Books API, OpenLibrary).
+</Note>
+
+## Authors
+
+Authors are stored in a separate table with many-to-many relationships to books:
+
+```typescript
+// Database schema
+table: author {
+  id: number;
+  name: string;        // Unique
+  source: string;      // "LOCAL", "GOOGLE_BOOKS", etc.
+  createdAt: Date;
+}
+
+table: book_author {
+  bookId: bigint;
+  authorId: number;
+  role: string | null; // "Author", "Translator", "Editor", etc.
+}
+```
+
+### Querying books with authors
+
+The book repository fetches authors efficiently:
+
+```typescript packages/api/src/routers/books/book.repository.ts
+async getWithMetadata(uuid: string) {
+  const bookRow = await this.getByUuid(uuid);
+  if (!bookRow) return null;
+
+  const metadata = await bookMetadataRepository.findByBookId(Number(bookRow.id));
+  
+  const authorRows = await db
+    .select({
+      name: author.name,
+      role: bookAuthor.role,
+    })
+    .from(bookAuthor)
+    .innerJoin(author, eq(author.id, bookAuthor.authorId))
+    .where(eq(bookAuthor.bookId, bookRow.id));
+
+  return {
+    ...bookRow,
+    ...metadata,
+    authors: authorRows.map((row) => ({
+      name: row.name,
+      role: row.role ?? "Author",
+    })),
+  };
+}
+```
+
+For list queries with multiple books, authors are fetched in bulk to avoid N+1 queries:
+
+```typescript packages/api/src/routers/books/book.repository.ts
+async listRecent(limit = 20, organizationId?: string) {
+  const rows = await db
+    .select({ /* book fields */ })
+    .from(book)
+    .orderBy(desc(book.createdAt))
+    .limit(limit);
+
+  // Fetch authors for all books in one query
+  const bookIds = rows.map((r) => r.id);
+  const authorsMap = new Map<number, { name: string; role: string }[]>();
+
+  if (bookIds.length > 0) {
+    const authorRows = await db
+      .select({
+        bookId: bookAuthor.bookId,
+        name: author.name,
+        role: bookAuthor.role,
+      })
+      .from(bookAuthor)
+      .innerJoin(author, eq(author.id, bookAuthor.authorId))
+      .where(
+        sql`${bookAuthor.bookId} = ANY(${sql.raw(`ARRAY[${bookIds.join(",")}]`)})`
+      );
+
+    for (const row of authorRows) {
+      const list = authorsMap.get(Number(row.bookId)) ?? [];
+      list.push({ name: row.name, role: row.role ?? "Author" });
+      authorsMap.set(Number(row.bookId), list);
+    }
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    authors: authorsMap.get(Number(row.id)) ?? [],
+  }));
+}
+```
+
+## Series
+
+Books can belong to a series:
+
+```typescript
+table: series {
+  id: number;
+  name: string;        // Unique
+  createdAt: Date;
+}
+
+table: book_metadata {
+  bookId: bigint;
+  seriesId: number | null;
+  seriesIndex: number | null;  // Position in series
+  // ... other metadata fields
+}
+```
+
+Series are automatically created when processing metadata:
+
+```typescript
+const seriesId = await bookMetadataRepository.upsertSeries(seriesName);
+await bookMetadataRepository.upsertMetadata(bookId, {
+  seriesId,
+  seriesIndex: 1,
+});
+```
+
+## Publishers
+
+Publishers are normalized entities shared across books:
+
+```typescript
+table: publisher {
+  id: number;
+  name: string;        // Unique
+  createdAt: Date;
+}
+```
+
+Publisher relationships are stored in the `book_metadata` table:
+
+```typescript
+const publisherId = await bookMetadataRepository.upsertPublisher("Example Press");
+await bookMetadataRepository.upsertMetadata(bookId, { publisherId });
+```
+
+## Collections
+
+Users can organize books into custom collections:
+
+```typescript packages/api/src/routers/collections/collections.model.ts
+export const CreateCollectionInput = z.object({
+  name: z.string().trim().min(1).max(80),
+  description: z.string().trim().max(280).optional(),
+  isPublic: z.boolean().default(false),
+  addBookUuid: z.string().optional(),
+});
+```
+
+Collections are implemented with a many-to-many join table:
+
+```typescript
+table: collection {
+  id: string;          // UUID
+  name: string;
+  description: string | null;
+  userId: string;
+  isPublic: boolean;
+  createdAt: Date;
+}
+
+table: collection_book {
+  collectionId: string;
+  bookId: bigint;
+  addedAt: Date;
+}
+```
+
+### Managing collection membership
+
+```typescript
+// Add or remove a book from a collection
+export const SetBookMembershipInput = z.object({
+  collectionId: z.string().uuid(),
+  bookUuid: z.string(),
+  inCollection: z.boolean(),
+});
+
+// List collections containing a specific book
+export const ListBookMembershipsInput = z.object({
+  bookUuid: z.string(),
+});
+```
+
+## Complete book model
+
+The complete book type combines all organizational metadata:
+
+```typescript packages/api/src/routers/books/book.model.ts
+const BasicInfoSchema = z.object({
+  id: z.number().int().nonnegative(),
+  filename: z.string(),
+  filesizeKb: z.number().nullable().optional(),
+  uuid: z.string(),
+  createdAt: z.string(),
+  lastModified: z.string().nullable().optional(),
+});
+
+const MediaInfoSchema = z.object({
+  cover: z.string().nullable().optional(),
+  downloadLink: z.string().nullable().optional(),
+  color: z.string().nullable().optional(),
+});
+
+export const BookSchema = BasicInfoSchema
+  .extend(MediaInfoSchema.shape)
+  .extend(MetadataInfoSchema.shape);
+
+export type BookComplete = z.infer<typeof BookSchema>;
+```
+
+## Metadata providers
+
+The provider interface allows extending metadata sources:
+
+```typescript packages/api/src/routers/books/metadata/providers/IMetadata.provider.ts
+export interface IMetadataProvider {
+  getMetadata(input: Partial<BookMetadata>): Promise<Partial<BookMetadata>>;
+}
+```
+
+Current implementation:
+
+<CardGroup cols={2}>
+  <Card title="Local provider" icon="book">
+    Extracts metadata from EPUB files using the file structure and package.opf
+  </Card>
+  <Card title="Future providers" icon="cloud">
+    Google Books API, OpenLibrary, or custom metadata sources can be added by implementing the `IMetadataProvider` interface
+  </Card>
+</CardGroup>
+
+## Organizational benefits
+
+<AccordionGroup>
+  <Accordion title="Deduplication">
+    Authors, publishers, and series are stored once and referenced by many books, ensuring consistency and reducing storage.
+  </Accordion>
+
+  <Accordion title="Bulk operations">
+    The repository layer uses efficient bulk queries to avoid N+1 problems when fetching related entities.
+  </Accordion>
+
+  <Accordion title="Flexible collections">
+    User-created collections enable personalized organization (reading lists, genres, favorites, etc.) without modifying book metadata.
+  </Accordion>
+</AccordionGroup>

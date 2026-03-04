@@ -1,0 +1,295 @@
+---
+title: Libraries
+description: Library management and filesystem scanning endpoints
+---
+
+The libraries router manages library configurations and triggers filesystem scans to index ebooks.
+
+## Create library
+
+Create a new library with optional filesystem paths.
+
+```typescript
+const library = await client.libraries.createLibrary({
+  name: "My Books",
+  isCronWatch: true,
+  isPublic: false,
+  paths: ["/mnt/books/fiction", "/mnt/books/non-fiction"],
+});
+```
+
+### Input
+
+<ParamField path="name" type="string" required>
+  Library name (minimum 1 character)
+</ParamField>
+
+<ParamField path="isCronWatch" type="boolean" default={false}>
+  Whether to automatically scan this library on a schedule
+</ParamField>
+
+<ParamField path="isPublic" type="boolean" default={false}>
+  Whether this library is visible to all organization members
+</ParamField>
+
+<ParamField path="paths" type="string[]">
+  Array of filesystem paths to scan for ebooks
+</ParamField>
+
+### Response
+
+<ResponseField name="id" type="number">
+  Library ID
+</ResponseField>
+
+<ResponseField name="name" type="string | null">
+  Library name
+</ResponseField>
+
+<ResponseField name="isCronWatch" type="boolean | null">
+  Whether automatic scanning is enabled
+</ResponseField>
+
+<ResponseField name="isPublic" type="boolean">
+  Whether library is public
+</ResponseField>
+
+<ResponseField name="createdAt" type="string">
+  ISO timestamp when library was created
+</ResponseField>
+
+<ResponseField name="paths" type="array">
+  Array of library path objects
+  <ResponseField name="id" type="number">
+    Path ID
+  </ResponseField>
+  <ResponseField name="libraryId" type="number">
+    Parent library ID
+  </ResponseField>
+  <ResponseField name="path" type="string">
+    Filesystem path
+  </ResponseField>
+  <ResponseField name="isEnabled" type="boolean | null">
+    Whether this path is enabled for scanning
+  </ResponseField>
+  <ResponseField name="createdAt" type="string">
+    ISO timestamp
+  </ResponseField>
+</ResponseField>
+
+## Get libraries
+
+List all libraries for the user's active organization.
+
+```typescript
+const libraries = await client.libraries.getLibraries();
+```
+
+### Response
+
+Array of library objects with paths included.
+
+## Get library by ID
+
+Retrieve a single library with its paths.
+
+```typescript
+const library = await client.libraries.getLibraryById({
+  id: 1,
+});
+```
+
+### Input
+
+<ParamField path="id" type="number" required>
+  Library ID
+</ParamField>
+
+### Response
+
+Library object with paths array.
+
+## Add path
+
+Add a filesystem path to an existing library.
+
+```typescript
+const path = await client.libraries.addPath({
+  libraryId: 1,
+  path: "/mnt/books/manga",
+});
+```
+
+### Input
+
+<ParamField path="libraryId" type="number" required>
+  Library ID
+</ParamField>
+
+<ParamField path="path" type="string" required>
+  Filesystem path (minimum 1 character)
+</ParamField>
+
+### Response
+
+Library path object.
+
+## Remove path
+
+Remove a filesystem path from a library.
+
+```typescript
+await client.libraries.removePath({
+  pathId: 5,
+});
+```
+
+### Input
+
+<ParamField path="pathId" type="number" required>
+  Library path ID
+</ParamField>
+
+## Update library
+
+Update library settings.
+
+```typescript
+const updated = await client.libraries.updateLibrary({
+  id: 1,
+  name: "Updated Name",
+  isCronWatch: true,
+  isPublic: true,
+});
+```
+
+### Input
+
+<ParamField path="id" type="number" required>
+  Library ID
+</ParamField>
+
+<ParamField path="name" type="string">
+  New library name (minimum 1 character)
+</ParamField>
+
+<ParamField path="isCronWatch" type="boolean">
+  Enable/disable automatic scanning
+</ParamField>
+
+<ParamField path="isPublic" type="boolean">
+  Update public visibility
+</ParamField>
+
+### Response
+
+Updated library object.
+
+## Delete library
+
+Delete a library and all its associated data.
+
+```typescript
+await client.libraries.deleteLibrary({
+  id: 1,
+});
+```
+
+### Input
+
+<ParamField path="id" type="number" required>
+  Library ID
+</ParamField>
+
+## Scan library
+
+Trigger a filesystem scan to discover and index ebooks.
+
+```typescript
+const result = await client.libraries.scanLibrary({
+  libraryId: 1,
+});
+console.log(result.jobId); // BullMQ job ID
+```
+
+### Input
+
+<ParamField path="libraryId" type="number" required>
+  Library ID to scan
+</ParamField>
+
+### Response
+
+<ResponseField name="jobId" type="string">
+  BullMQ job ID for tracking the scan operation
+</ResponseField>
+
+## Library scanning process
+
+When you trigger a library scan:
+
+1. **Discovery phase** - The scanner recursively walks all library paths, discovering ebook files (EPUB, PDF, etc.)
+2. **File events** - For each discovered file, a `file-event` job is queued to BullMQ
+3. **Book creation** - The `file.event.worker` processes each file:
+   - Extracts basic metadata from the file
+   - Creates a `book` record in the database
+   - Creates a `scanned_file` record to prevent duplicate processing
+   - Queues a `book-index` job for Elasticsearch indexing
+4. **Indexing** - The `book.index.worker` indexes books into Elasticsearch with full metadata
+
+### Supported formats
+
+- EPUB
+- PDF
+- Additional formats may be supported depending on metadata extractors
+
+## Example: Create and scan library
+
+```typescript
+// 1. Create library
+const library = await client.libraries.createLibrary({
+  name: "Japanese Literature",
+  isCronWatch: true,
+  isPublic: false,
+  paths: ["/data/books/japanese"],
+});
+
+// 2. Trigger initial scan
+const scanResult = await client.libraries.scanLibrary({
+  libraryId: library.id,
+});
+
+console.log(`Scan started: ${scanResult.jobId}`);
+
+// 3. Poll for books
+setInterval(async () => {
+  const books = await client.books.listRecent({ limit: 10 });
+  console.log(`Found ${books.length} books`);
+}, 5000);
+```
+
+## Library types
+
+The library model is defined in `packages/api/src/routers/libraries/library.model.ts`:
+
+```typescript
+const LibrarySchema = z.object({
+  id: z.number().int().nonnegative(),
+  name: z.string().nullable().optional(),
+  isCronWatch: z.boolean().nullable().optional(),
+  isPublic: z.boolean(),
+  createdAt: z.string(),
+});
+
+const LibraryPathSchema = z.object({
+  id: z.number().int().nonnegative(),
+  libraryId: z.number().int().nonnegative(),
+  path: z.string(),
+  isEnabled: z.boolean().nullable().optional(),
+  createdAt: z.string(),
+});
+
+export const LibraryWithPathsSchema = LibrarySchema.extend({
+  paths: z.array(LibraryPathSchema).optional(),
+});
+```
